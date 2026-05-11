@@ -139,6 +139,7 @@ def build_main_window():
 
 
 if __name__ == "__main__":
-    # Required for multiprocessing on Windows
-    multiprocessing.freeze_support()
+    # # Required for multiprocessing on Windows
+    # multiprocessing.freeze_support()
+    multiprocessing.set_start_method("spawn")
     build_main_window()

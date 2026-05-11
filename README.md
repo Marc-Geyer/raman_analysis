@@ -6,9 +6,8 @@ Each CSV file you open runs in its **own independent process** so windows never 
 ## Requirements
 
 ```
-pip install numpy matplotlib
+pip install -r requirements.txt
 ```
-(Tkinter ships with Python on all platforms)
 
 ## Usage
 

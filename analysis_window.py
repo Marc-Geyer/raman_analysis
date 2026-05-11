@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import sys
 import tkinter as tk
+import traceback
 from tkinter import ttk, messagebox, colorchooser
 from typing import Optional
 import csv
@@ -53,6 +54,25 @@ def _next_color(used: list[str]) -> str:
 
 
 # ── CSV loader ────────────────────────────────────────────────────────────────
+def filter_positive_times(
+    times: np.ndarray,
+    intensities: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Removes all columns where time < 0.
+    Keeps times and intensities aligned.
+    """
+
+    mask = times >= 0
+
+    filtered_times = times[mask]
+
+    if intensities.ndim == 2:
+        filtered_intensities = intensities[:, mask]
+    else:
+        filtered_intensities = intensities
+
+    return filtered_times, filtered_intensities
 
 def load_raman_csv(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -94,8 +114,13 @@ def load_raman_csv(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     wavenumbers = np.array(wavenumbers, dtype=float)
     intensities = np.array(intensities, dtype=float)
     # Guarantee shape [N_wn, N_t]
-    if intensities.shape[1] != len(times):
+    if intensities.ndim == 2 and intensities.shape[1] != len(times):
         intensities = intensities[:, : len(times)]
+
+    times, intensities = filter_positive_times(
+        times,
+        intensities
+    )
 
     return wavenumbers, times, intensities
 
@@ -277,8 +302,8 @@ class AnalysisWindow:
         # keyboard bindings
         r.bind("<Left>",  lambda e: self._nudge_focused(-1))
         r.bind("<Right>", lambda e: self._nudge_focused(+1))
-        r.bind("<Up>",    lambda e: self._nudge_focused(-1))
-        r.bind("<Down>",  lambda e: self._nudge_focused(+1))
+        r.bind("<Up>",    lambda e: self._nudge_focused(+1))
+        r.bind("<Down>",  lambda e: self._nudge_focused(-1))
         r.bind("<Delete>", lambda e: self._remove_focused_slice())
         r.bind("<Escape>", lambda e: self._set_focused(None))
 
@@ -292,6 +317,7 @@ class AnalysisWindow:
                                  f"Could not read file:\n{self.path}\n\n{exc}",
                                  parent=self.root)
             self.root.destroy()
+            traceback.print_exc()
             return
 
         self.wavenumbers = wn
@@ -332,32 +358,47 @@ class AnalysisWindow:
         )
         # Redraw existing slice lines
         for s in self.slices:
+            s.line_obj = None
             self._draw_slice_line(s)
 
         self._canvas_heat.draw_idle()
 
     def _draw_slice_line(self, s: Slice):
-        ax = self._ax_heat
-        lw = 2.0 if s is self._focused_slice else 1.2
-        ls = "-" if s is self._focused_slice else "--"
-        if s.line_obj is not None:
-            try:
-                s.line_obj.remove()
-            except Exception:
-                pass
-            s.line_obj = None
-        if not s.visible:
-            return
+
+        focused = s is self._focused_slice
+
+        lw = 2.0 if focused else 1.2
+        ls = "-" if focused else "--"
+
         if s.kind == "vertical":
-            t_val = self.times[s.index]
-            line, = ax.axvline(t_val, color=s.color, lw=lw, ls=ls,
-                               label=s.label, picker=5)
+            val = self.times[s.index]
+            if s.line_obj is None:
+                s.line_obj = self._ax_heat.axvline(
+                    val,
+                    color=s.color,
+                    lw=lw,
+                    ls=ls
+                )
+            else:
+                s.line_obj.set_xdata([val, val])
+
         else:
-            wn_val = self.wavenumbers[s.index]
-            line, = ax.axhline(wn_val, color=s.color, lw=lw, ls=ls,
-                               label=s.label, picker=5)
-        s.line_obj = line
-        self._canvas_heat.draw_idle()
+            val = self.wavenumbers[s.index]
+
+            if s.line_obj is None:
+                s.line_obj = self._ax_heat.axhline(
+                    val,
+                    color=s.color,
+                    lw=lw,
+                    ls=ls
+                )
+            else:
+                s.line_obj.set_ydata([val, val])
+
+        s.line_obj.set_color(s.color)
+        s.line_obj.set_linewidth(lw)
+        s.line_obj.set_linestyle(ls)
+        s.line_obj.set_visible(s.visible)
 
     # ── slice management ──────────────────────────────────────────────────────
 
@@ -489,10 +530,10 @@ class AnalysisWindow:
                     self._refresh_spectrum_plot()
                 else:
                     self._refresh_time_plot()
-                self._rebuild_slice_list()
 
     def _on_heat_release(self, event):
         self._drag_slice = None
+        self._rebuild_slice_list()
 
     def _on_heat_scroll(self, event):
         """Scroll to nudge focused slice."""
