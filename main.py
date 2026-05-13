@@ -10,12 +10,13 @@ import multiprocessing
 import os
 import sys
 
+import theme as T
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _launch_analysis(csv_path: str):
     """Target function that runs inside a fresh process."""
-    # Import here so the child process loads modules independently
     from analysis_window import run_analysis_window
     run_analysis_window(csv_path)
 
@@ -45,35 +46,49 @@ def build_main_window():
     root.title("Raman Viewer – Launcher")
     root.geometry("600x400")
     root.minsize(480, 320)
-    root.configure(bg="#1a1a2e")
+    root.configure(bg=T.BG_APP)
 
     style = ttk.Style(root)
     style.theme_use("clam")
-    style.configure("TFrame", background="#1a1a2e")
-    style.configure("TLabel", background="#1a1a2e", foreground="#e0e0e0",
-                    font=("Courier New", 11))
-    style.configure("Title.TLabel", background="#1a1a2e", foreground="#00d4ff",
-                    font=("Courier New", 18, "bold"))
-    style.configure("Sub.TLabel", background="#1a1a2e", foreground="#888",
-                    font=("Courier New", 9))
-    style.configure("Open.TButton", font=("Courier New", 11, "bold"),
-                    foreground="#1a1a2e", background="#00d4ff",
-                    borderwidth=0, focusthickness=0, padding=(16, 8))
+
+    style.configure("TFrame",
+                    background=T.BG_APP)
+    style.configure("TLabel",
+                    background=T.BG_APP,
+                    foreground=T.FG_LABEL,
+                    font=(T.FONT_MONO, T.FONT_SIZE_BODY))
+    style.configure("Title.TLabel",
+                    background=T.BG_APP,
+                    foreground=T.FG_TITLE,
+                    font=(T.FONT_MONO, 18, "bold"))
+    style.configure("Sub.TLabel",
+                    background=T.BG_APP,
+                    foreground=T.FG_SUBTLE,
+                    font=(T.FONT_MONO, T.FONT_SIZE_SMALL))
+    style.configure("Open.TButton",
+                    font=(T.FONT_MONO, T.FONT_SIZE_BODY, "bold"),
+                    foreground=T.FG_ON_ACCENT,
+                    background=T.ACCENT,
+                    borderwidth=0,
+                    focusthickness=0,
+                    padding=(16, 8))
     style.map("Open.TButton",
-              background=[("active", "#00aacc"), ("pressed", "#007fa0")])
-    style.configure("TListbox", background="#0d0d1a", foreground="#b0d4e0",
-                    font=("Courier New", 9))
+              background=[("active", T.ACCENT_HOVER),
+                          ("pressed", T.ACCENT_PRESSED)])
 
     # ── header ──
     hdr = ttk.Frame(root, padding=(24, 20, 24, 8))
     hdr.pack(fill=tk.X)
-    ttk.Label(hdr, text="⬡  RAMAN VIEWER", style="Title.TLabel").pack(anchor=tk.W)
-    ttk.Label(hdr, text="Each CSV opens in its own independent analysis window",
+    ttk.Label(hdr, text="⬡  RAMAN VIEWER",
+              style="Title.TLabel").pack(anchor=tk.W)
+    ttk.Label(hdr,
+              text="Each CSV opens in its own independent analysis window",
               style="Sub.TLabel").pack(anchor=tk.W, pady=(2, 0))
 
-    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=24)
+    sep = ttk.Separator(root, orient=tk.HORIZONTAL)
+    sep.pack(fill=tk.X, padx=24)
 
-    # ── drop-hint / button area ──
+    # ── button area ──
     btn_frame = ttk.Frame(root, padding=(24, 16))
     btn_frame.pack(fill=tk.X)
 
@@ -86,7 +101,8 @@ def build_main_window():
     )
     open_btn.pack(side=tk.LEFT)
 
-    ttk.Label(btn_frame, text="  or drag files into the list below",
+    ttk.Label(btn_frame,
+              text="  or drag files into the list below",
               style="Sub.TLabel").pack(side=tk.LEFT, padx=8)
 
     # ── recent files list ──
@@ -96,24 +112,28 @@ def build_main_window():
     ttk.Label(list_frame, text="Opened this session:",
               style="Sub.TLabel").pack(anchor=tk.W)
 
-    lb_frame = tk.Frame(list_frame, bg="#0d0d1a", bd=1, relief=tk.SOLID)
+    lb_frame = tk.Frame(list_frame, bg=T.COLOR_SPINE, bd=1, relief=tk.SOLID)
     lb_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
-    scrollbar = tk.Scrollbar(lb_frame, orient=tk.VERTICAL,
-                              bg="#1a1a2e", troughcolor="#0d0d1a",
-                              activebackground="#00d4ff")
+    scrollbar = tk.Scrollbar(
+        lb_frame, orient=tk.VERTICAL,
+        bg=T.BG_APP, troughcolor=T.BG_LISTBOX,
+        activebackground=T.ACCENT,
+    )
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     listbox = tk.Listbox(
         lb_frame, yscrollcommand=scrollbar.set,
-        bg="#0d0d1a", fg="#7ecfea", selectbackground="#00334d",
-        selectforeground="#ffffff", font=("Courier New", 9),
+        bg=T.BG_LISTBOX,
+        fg=T.LB_FG,
+        selectbackground=T.LB_SELECT_BG,
+        selectforeground=T.LB_SELECT_FG,
+        font=(T.FONT_MONO, T.FONT_SIZE_SMALL),
         borderwidth=0, highlightthickness=0, activestyle="none",
     )
     listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     scrollbar.config(command=listbox.yview)
 
-    # Re-open on double-click
     def on_double_click(event):
         sel = listbox.curselection()
         if sel:
@@ -121,17 +141,20 @@ def build_main_window():
             if os.path.exists(path):
                 _start_process(path, status_var)
             else:
-                messagebox.showerror("File not found", f"Cannot find:\n{path}")
+                messagebox.showerror("File not found",
+                                     f"Cannot find:\n{path}")
 
     listbox.bind("<Double-Button-1>", on_double_click)
 
     # ── status bar ──
-    status_bar = tk.Label(root, textvariable=status_var,
-                          bg="#0d0d1a", fg="#555", font=("Courier New", 8),
-                          anchor=tk.W, padx=12, pady=4)
+    status_bar = tk.Label(
+        root, textvariable=status_var,
+        bg=T.BG_STATUS, fg=T.FG_STATUS,
+        font=(T.FONT_MONO, T.FONT_SIZE_SMALL),
+        anchor=tk.W, padx=12, pady=4,
+    )
     status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
-    # ── keyboard shortcut ──
     root.bind("<Control-o>", lambda e: open_file(listbox, status_var))
     root.bind("<Return>",    lambda e: open_file(listbox, status_var))
 
@@ -139,7 +162,5 @@ def build_main_window():
 
 
 if __name__ == "__main__":
-    # # Required for multiprocessing on Windows
-    # multiprocessing.freeze_support()
     multiprocessing.set_start_method("spawn")
     build_main_window()
