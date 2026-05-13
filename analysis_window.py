@@ -998,6 +998,7 @@ class AnalysisWindow:
 
 def run_analysis_window(csv_path: str):
     root = tk.Tk()
+    # root.iconphoto(True, tk.PhotoImage(file="canvas.png"))
     app = AnalysisWindow(root, csv_path)
     root.mainloop()
 

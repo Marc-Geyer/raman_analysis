@@ -44,6 +44,7 @@ def _start_process(path: str, status_var: tk.StringVar):
 def build_main_window():
     root = tk.Tk()
     root.title("Raman Viewer – Launcher")
+    # root.iconphoto(True, tk.PhotoImage(file="canvas.png"))
     root.geometry("600x400")
     root.minsize(480, 320)
     root.configure(bg=T.BG_APP)
