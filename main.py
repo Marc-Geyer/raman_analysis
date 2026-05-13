@@ -162,5 +162,6 @@ def build_main_window():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     multiprocessing.set_start_method("spawn")
     build_main_window()
