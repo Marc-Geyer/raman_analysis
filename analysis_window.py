@@ -34,7 +34,9 @@ import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.colors as mcolors
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 
 import theme as T
@@ -124,8 +126,9 @@ class Slice:
 # ── helpers: apply consistent axes styling ────────────────────────────────────
 
 def _style_axes(ax, xlabel: str, ylabel: str, title: str,
+                fig_facecolor: str = T.BG_FIGURE,
                 axes_facecolor: str = T.BG_AXES):
-    """Apply the shared theme style to any matplotlib Axes."""
+    """Apply the shared light-theme style to any matplotlib Axes."""
     ax.set_facecolor(axes_facecolor)
     ax.tick_params(colors=T.FG_TICK, labelsize=T.FONT_SIZE_SMALL)
     for sp in ax.spines.values():
@@ -158,6 +161,10 @@ class AnalysisWindow:
         self._focused_slice: Optional[Slice] = None
         self._cmap = T.DEFAULT_CMAP
         self._heatmap_img = None
+
+        # slice-list widget cache: uid → dict of tk widgets
+        # populated by _rebuild_slice_list_full, patched by _update_slice_widgets
+        self._slice_widgets: dict[int, dict] = {}
 
         self._build_ui()
         self._load_data()
@@ -298,6 +305,11 @@ class AnalysisWindow:
         self._canvas_time = FigureCanvasTkAgg(self._fig_time, master=time_frame)
         self._canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+        self._fig_spec.canvas.mpl_connect("motion_notify_event",
+                                          self._on_spec_motion)
+        self._fig_time.canvas.mpl_connect("motion_notify_event",
+                                          self._on_time_motion)
+
         # ── slice list panel (bottom) ──
         slice_panel = tk.Frame(r, bg=T.BG_SLICE_BAR, pady=4)
         slice_panel.pack(fill=tk.X, side=tk.BOTTOM)
@@ -352,6 +364,7 @@ class AnalysisWindow:
                     xlabel="Time",
                     ylabel="Wavenumber (cm⁻¹)",
                     title="Raman Intensity Heatmap",
+                    fig_facecolor=T.BG_FIGURE,
                     axes_facecolor=T.BG_AXES)
 
         t0, t1 = self.times[0], self.times[-1]
@@ -406,9 +419,9 @@ class AnalysisWindow:
         color = _next_color(self._used_colors())
         s = Slice("vertical", idx, color)
         self.slices.append(s)
-        self._rebuild_slice_list()
-        self._set_focused(s)
         self._draw_slice_line(s)
+        self._focused_slice = s          # set before rebuild so border is right
+        self._rebuild_slice_list()       # structural change → full rebuild
         self._refresh_spectrum_plot()
 
     def _add_horizontal_slice(self):
@@ -417,8 +430,8 @@ class AnalysisWindow:
         s = Slice("horizontal", idx, color)
         self.slices.append(s)
         self._draw_slice_line(s)
-        self._set_focused(s)
-        self._rebuild_slice_list()
+        self._focused_slice = s          # set before rebuild so border is right
+        self._rebuild_slice_list()       # structural change → full rebuild
         self._refresh_time_plot()
 
     def _remove_focused_slice(self):
@@ -431,9 +444,9 @@ class AnalysisWindow:
             except Exception:
                 pass
         self.slices.remove(s)
-        self._set_focused(None)
+        self._focused_slice = None       # clear before rebuild
         self._canvas_heat.draw_idle()
-        self._rebuild_slice_list()
+        self._rebuild_slice_list()       # structural change → full rebuild
         self._refresh_spectrum_plot()
         self._refresh_time_plot()
 
@@ -443,7 +456,10 @@ class AnalysisWindow:
         for sl in [prev, s]:
             if sl is not None:
                 self._draw_slice_line(sl)
-        self._rebuild_slice_list()
+        # Only patch border/style of affected items — no layout change
+        for sl in [prev, s]:
+            if sl is not None:
+                self._update_slice_widgets(sl)
 
     def _nudge_focused(self, delta: int):
         s = self._focused_slice
@@ -457,7 +473,7 @@ class AnalysisWindow:
             self._refresh_spectrum_plot()
         else:
             self._refresh_time_plot()
-        self._rebuild_slice_list()
+        self._update_slice_widgets(s)   # only the label text changes
 
     # ── heatmap mouse interaction ─────────────────────────────────────────────
 
@@ -517,14 +533,44 @@ class AnalysisWindow:
                     self._refresh_spectrum_plot()
                 else:
                     self._refresh_time_plot()
+                self._update_slice_widgets(s)  # label value only
 
     def _on_heat_release(self, event):
         self._drag_slice = None
-        self._rebuild_slice_list()
+        # nothing to rebuild — label was kept live during drag
 
     def _on_heat_scroll(self, event):
         delta = 1 if event.button == "up" else -1
         self._nudge_focused(delta)
+
+    def _on_spec_motion(self, event):
+        """Update crosshair info when hovering the spectrum (right-top) plot."""
+        if event.inaxes != self._ax_spec or event.xdata is None:
+            return
+        wi = int(np.clip(np.searchsorted(self.wavenumbers, event.xdata),
+                         0, len(self.wavenumbers) - 1))
+        # no single time value known here — show wavenumber + intensity range
+        if self.intensity.size:
+            row = self.intensity[wi, :]
+            self._info_var.set(
+                f"wn={self.wavenumbers[wi]:.1f}  "
+                f"I_min={np.nanmin(row):.4g}  I_max={np.nanmax(row):.4g}")
+        else:
+            self._info_var.set(f"wn={event.xdata:.1f}")
+
+    def _on_time_motion(self, event):
+        """Update crosshair info when hovering the time trace (right-bottom) plot."""
+        if event.inaxes != self._ax_time or event.xdata is None:
+            return
+        ti = int(np.clip(np.searchsorted(self.times, event.xdata),
+                         0, len(self.times) - 1))
+        if self.intensity.size:
+            col = self.intensity[:, ti]
+            self._info_var.set(
+                f"t={self.times[ti]:.3g}  "
+                f"I_min={np.nanmin(col):.4g}  I_max={np.nanmax(col):.4g}")
+        else:
+            self._info_var.set(f"t={event.xdata:.3g}")
 
     # ── right-panel plots ─────────────────────────────────────────────────────
 
@@ -575,50 +621,92 @@ class AnalysisWindow:
         self._canvas_time.draw_idle()
 
     # ── slice list bar ────────────────────────────────────────────────────────
+    # Strategy: _rebuild_slice_list_full() destroys/recreates all widgets and
+    # is called only when the set of slices changes (add / remove).
+    # _update_slice_widgets(s) patches a single slice's existing widgets in-place
+    # and is used for every high-frequency event (drag, nudge, focus change,
+    # color/visibility toggle).  No layout shifts, no flicker.
 
     def _rebuild_slice_list(self):
+        """Full rebuild — call only when slices are added or removed."""
         for w in self._slice_list_frame.winfo_children():
             w.destroy()
+        self._slice_widgets.clear()
 
         for s in self.slices:
-            frame = tk.Frame(self._slice_list_frame,
-                             bg=T.BG_SLICE_BAR, padx=3, pady=1)
-            frame.pack(side=tk.LEFT)
+            widgets = self._create_slice_widgets(s)
+            self._slice_widgets[s.uid] = widgets
 
-            focused = s is self._focused_slice
-            border_color = s.color if focused else T.COLOR_SPINE
-            inner = tk.Frame(frame, bg=border_color, padx=1, pady=1)
-            inner.pack()
+    def _create_slice_widgets(self, s: Slice) -> dict:
+        """Build all tk widgets for one slice entry and return a reference dict."""
+        focused = s is self._focused_slice
+        border_color = s.color if focused else T.COLOR_SPINE
 
-            row = tk.Frame(inner, bg=T.BG_PANEL)
-            row.pack()
+        frame = tk.Frame(self._slice_list_frame,
+                         bg=T.BG_SLICE_BAR, padx=3, pady=1)
+        frame.pack(side=tk.LEFT)
 
-            # color swatch → open color picker
-            swatch = tk.Label(row, bg=s.color, width=2, cursor="hand2")
-            swatch.pack(side=tk.LEFT)
-            swatch.bind("<Button-1>", lambda e, sl=s: self._pick_color(sl))
+        inner = tk.Frame(frame, bg=border_color, padx=1, pady=1)
+        inner.pack()
 
-            # label with value
-            kind_icon = "│" if s.kind == "vertical" else "─"
-            arr = self.times if s.kind == "vertical" else self.wavenumbers
-            val = arr[s.index] if arr.size else 0
-            lbl_text = f" {kind_icon}{s.label}={val:.3g} "
-            lbl = tk.Label(row, text=lbl_text,
-                           bg=T.BG_PANEL, fg=s.color,
+        row = tk.Frame(inner, bg=T.BG_PANEL)
+        row.pack()
+
+        # color swatch
+        swatch = tk.Label(row, bg=s.color, width=2, cursor="hand2")
+        swatch.pack(side=tk.LEFT)
+        swatch.bind("<Button-1>", lambda e, sl=s: self._pick_color(sl))
+
+        # value label
+        arr = self.times if s.kind == "vertical" else self.wavenumbers
+        val = arr[s.index] if arr.size else 0
+        kind_icon = "│" if s.kind == "vertical" else "─"
+        lbl_text = f" {kind_icon}{s.label}={val:.3g} "
+        lbl = tk.Label(row, text=lbl_text,
+                       bg=T.BG_PANEL, fg=s.color,
+                       font=(T.FONT_MONO, T.FONT_SIZE_SMALL),
+                       cursor="hand2")
+        lbl.pack(side=tk.LEFT)
+        lbl.bind("<Button-1>", lambda e, sl=s: self._set_focused(sl))
+
+        # visibility toggle
+        eye = "◉" if s.visible else "○"
+        vis_btn = tk.Label(row, text=eye,
+                           bg=T.BG_PANEL, fg=T.FG_SUBTLE,
                            font=(T.FONT_MONO, T.FONT_SIZE_SMALL),
                            cursor="hand2")
-            lbl.pack(side=tk.LEFT)
-            lbl.bind("<Button-1>", lambda e, sl=s: self._set_focused(sl))
+        vis_btn.pack(side=tk.LEFT)
+        vis_btn.bind("<Button-1>", lambda e, sl=s: self._toggle_visible(sl))
 
-            # visibility toggle
-            eye = "◉" if s.visible else "○"
-            vis_btn = tk.Label(row, text=eye,
-                               bg=T.BG_PANEL, fg=T.FG_SUBTLE,
-                               font=(T.FONT_MONO, T.FONT_SIZE_SMALL),
-                               cursor="hand2")
-            vis_btn.pack(side=tk.LEFT)
-            vis_btn.bind("<Button-1>",
-                         lambda e, sl=s: self._toggle_visible(sl))
+        return dict(frame=frame, inner=inner, swatch=swatch, lbl=lbl,
+                    vis_btn=vis_btn)
+
+    def _update_slice_widgets(self, s: Slice):
+        """Patch existing widgets for slice *s* without touching layout."""
+        widgets = self._slice_widgets.get(s.uid)
+        if widgets is None:
+            return  # slice not yet in the bar (shouldn't happen, but guard)
+
+        focused = s is self._focused_slice
+        border_color = s.color if focused else T.COLOR_SPINE
+
+        # border frame highlight
+        widgets["inner"].configure(bg=border_color)
+
+        # color swatch
+        widgets["swatch"].configure(bg=s.color)
+
+        # value label text + color
+        arr = self.times if s.kind == "vertical" else self.wavenumbers
+        val = arr[s.index] if arr.size else 0
+        kind_icon = "│" if s.kind == "vertical" else "─"
+        widgets["lbl"].configure(
+            text=f" {kind_icon}{s.label}={val:.3g} ",
+            fg=s.color,
+        )
+
+        # visibility toggle glyph
+        widgets["vis_btn"].configure(text="◉" if s.visible else "○")
 
     def _pick_color(self, s: Slice):
         color = colorchooser.askcolor(color=s.color,
@@ -630,7 +718,7 @@ class AnalysisWindow:
             self._canvas_heat.draw_idle()
             self._refresh_spectrum_plot()
             self._refresh_time_plot()
-            self._rebuild_slice_list()
+            self._update_slice_widgets(s)   # only color props change
 
     def _toggle_visible(self, s: Slice):
         s.visible = not s.visible
@@ -638,7 +726,7 @@ class AnalysisWindow:
         self._canvas_heat.draw_idle()
         self._refresh_spectrum_plot()
         self._refresh_time_plot()
-        self._rebuild_slice_list()
+        self._update_slice_widgets(s)       # only eye glyph changes
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
