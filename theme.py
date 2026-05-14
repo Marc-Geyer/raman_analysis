@@ -66,6 +66,6 @@ FONT_SIZE_BODY  = 9
 FONT_SIZE_SMALL = 8
 
 # ── Default colormap ──────────────────────────────────────────────────────────
-DEFAULT_CMAP    = "viridis"
+DEFAULT_CMAP    = "turbo"
 AVAILABLE_CMAPS = ["viridis", "plasma", "inferno", "magma", "turbo",
                    "hot", "gray", "RdYlBu_r", "seismic", "cividis"]

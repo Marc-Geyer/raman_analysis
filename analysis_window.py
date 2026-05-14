@@ -1,44 +1,52 @@
 """
-Raman Data Viewer – Analysis Window
-====================================
-Displays a 2-D Raman dataset (intensity vs wavenumber × time) as an
-interactive heatmap with draggable / arrow-key-tunable slice selectors
-and rectangle region selectors that produce averaged spectra / time traces.
+Raman Data Viewer – Analysis Window  (refactored)
+==================================================
+Key architectural changes vs. the original
+-------------------------------------------
+1.  **PlotPanel** – owns one matplotlib Figure/Axes pair embedded in a given
+    Tk parent frame.  It maintains a dict of ``Line2D`` objects keyed by a
+    stable UID so that updates call ``line.set_data()`` + ``relim /
+    autoscale_view`` instead of ``ax.cla()`` followed by a full redraw.
+    The only time the axes are cleared is when an item is *removed*.
 
-CSV format expected
--------------------
+2.  **RegionPlotWindow** – a ``tk.Toplevel`` that holds two ``PlotPanel``s
+    (spectrum + time trace) for a *single* region.  Each region gets its own
+    floating window opened on demand via "Open detail…" in the region bar.
+
+3.  ``AnalysisWindow`` delegates every plot mutation to the ``PlotPanel``
+    instances; it no longer touches matplotlib artists directly.
+
+CSV format
+----------
   • Row 0 (header): first cell ignored, remaining cells = time values
   • Rows 1-N:  first cell = wavenumber,  remaining cells = intensity values
 
-Layout
-------
+Layout (main window)
+--------------------
   ┌─────────────────────────────┬──────────────────────────┐
-  │  Heatmap  (canvas)          │  Spectrum plot (right)   │
-  │  – draggable vertical lines │  intensity vs wavenumber │
-  │  – draggable horiz. lines   ├──────────────────────────┤
-  │  – draggable rect regions   │  Time trace (right-bot)  │
-  │                             │  intensity vs time       │
+  │  Heatmap                    │  Spectrum (V-slices)     │
+  │  draggable V / H lines      ├──────────────────────────┤
+  │  draggable rect regions     │  Time trace (H-slices)   │
   └─────────────────────────────┴──────────────────────────┘
-  Bottom toolbar: slices bar / regions bar, colormap picker, crosshair info
+  Bottom toolbar: slice bar / region bar, cmap picker, crosshair info
 
-Region averaged plots
----------------------
-  Vertical slices   → spectrum plot   (intensity vs wavenumber)
-  Horizontal slices → time plot       (intensity vs time)
-  Regions           → BOTH plots
-      spectrum plot : mean intensity over the region's time range  vs wavenumber
-      time plot     : mean intensity over the region's wn range    vs time
-  Region lines are drawn with lw=2, ls="-." to distinguish from slice lines.
+  Region windows (one per region, opened on demand)
+  ┌────────────────────────────────────────────────┐
+  │  Mean spectrum  (averaged over region t-range) │
+  ├────────────────────────────────────────────────┤
+  │  Mean time trace (averaged over region wn-range│
+  └────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
+
 import os
 import sys
-import tkinter as tk
+import csv
 import traceback
+import tkinter as tk
 from tkinter import ttk, messagebox, colorchooser
 from typing import Optional
-import csv
 
 import numpy as np
 import matplotlib
@@ -51,112 +59,16 @@ from matplotlib.lines import Line2D
 import theme as T
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _next_color(used: list[str]) -> str:
     for c in T.SLICE_COLORS:
         if c not in used:
             return c
     return T.SLICE_COLORS[len(used) % len(T.SLICE_COLORS)]
 
-
-# ── CSV loader ────────────────────────────────────────────────────────────────
-
-def filter_positive_times(times, intensities):
-    mask = times >= 0
-    filtered_times = times[mask]
-    filtered_intensities = intensities[:, mask] if intensities.ndim == 2 else intensities
-    return filtered_times, filtered_intensities
-
-
-def load_raman_csv(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (wavenumbers [N], times [M], intensity [N×M])."""
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        sample = fh.read(4096)
-    delimiter = "," if sample.count(",") >= sample.count(";") else ";"
-
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.reader(fh, delimiter=delimiter)
-        rows = [r for r in reader if any(c.strip() for c in r)]
-
-    def to_float(s):
-        return float(s.strip().replace(",", "."))
-
-    header = rows[0]
-    times = np.array([to_float(c) for c in header[1:] if c.strip()])
-
-    wavenumbers, intensities = [], []
-    for row in rows[1:]:
-        if not row or not row[0].strip():
-            continue
-        try:
-            wn = to_float(row[0])
-        except ValueError:
-            continue
-        vals = []
-        for c in row[1: 1 + len(times)]:
-            try:
-                vals.append(to_float(c))
-            except ValueError:
-                vals.append(np.nan)
-        if vals:
-            wavenumbers.append(wn)
-            intensities.append(vals)
-
-    wavenumbers = np.array(wavenumbers, dtype=float)
-    intensities = np.array(intensities, dtype=float)
-    if intensities.ndim == 2 and intensities.shape[1] != len(times):
-        intensities = intensities[:, : len(times)]
-
-    times, intensities = filter_positive_times(times, intensities)
-    return wavenumbers, times, intensities
-
-
-# ── Slice descriptor ──────────────────────────────────────────────────────────
-
-class Slice:
-    """One draggable selector line on the heatmap."""
-    _id_counter = 0
-
-    def __init__(self, kind: str, index: int, color: str, label: str = ""):
-        Slice._id_counter += 1
-        self.uid = Slice._id_counter
-        self.kind = kind        # "vertical" | "horizontal"
-        self.index = index
-        self.color = color
-        self.label = label or f"{'W' if kind == 'vertical' else 'T'}{self.uid}"
-        self.line_obj: Optional[Line2D] = None
-        self.visible = True
-
-
-# ── Region descriptor ─────────────────────────────────────────────────────────
-
-class Region:
-    """
-    A rectangular selection on the heatmap defined by index ranges.
-
-    ti0, ti1  – time-axis indices  (ti0 <= ti1)
-    wi0, wi1  – wavenumber indices (wi0 <= wi1)
-
-    Produces:
-      averaged spectrum  : mean over times[ti0:ti1+1]  -> I vs wavenumber
-      averaged time trace: mean over wavenumbers[wi0:wi1+1] -> I vs time
-    """
-    _id_counter = 0
-
-    def __init__(self, ti0: int, ti1: int, wi0: int, wi1: int,
-                 color: str, label: str = ""):
-        Region._id_counter += 1
-        self.uid = Region._id_counter
-        self.ti0 = ti0
-        self.ti1 = ti1
-        self.wi0 = wi0
-        self.wi1 = wi1
-        self.color = color
-        self.label = label or f"R{self.uid}"
-        self.rect_obj: Optional[Rectangle] = None
-        self.visible = True
-
-
-# ── shared axes style helper ──────────────────────────────────────────────────
 
 def _style_axes(ax, xlabel: str, ylabel: str, title: str,
                 axes_facecolor: str = T.BG_AXES):
@@ -170,13 +82,344 @@ def _style_axes(ax, xlabel: str, ylabel: str, title: str,
     ax.grid(True, color=T.COLOR_GRID, linewidth=0.5, linestyle="--", alpha=0.7)
 
 
-# ── Analysis Window ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _filter_positive_times(times: np.ndarray,
+                            intensities: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mask = times >= 0
+    return times[mask], intensities[:, mask]
+
+
+def load_raman_csv(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (wavenumbers [N], times [M], intensity [N×M])."""
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        sample = fh.read(4096)
+    delim = "," if sample.count(",") >= sample.count(";") else ";"
+
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        rows = [r for r in csv.reader(fh, delimiter=delim)
+                if any(c.strip() for c in r)]
+
+    def _f(s: str) -> float:
+        return float(s.strip().replace(",", "."))
+
+    times = np.array([_f(c) for c in rows[0][1:] if c.strip()])
+    wavenumbers, intensities = [], []
+    for row in rows[1:]:
+        if not row or not row[0].strip():
+            continue
+        try:
+            wn = _f(row[0])
+        except ValueError:
+            continue
+        vals = []
+        for c in row[1: 1 + len(times)]:
+            try:
+                vals.append(_f(c))
+            except ValueError:
+                vals.append(np.nan)
+        if vals:
+            wavenumbers.append(wn)
+            intensities.append(vals)
+
+    wavenumbers = np.array(wavenumbers, dtype=float)
+    intensities = np.array(intensities, dtype=float)
+    if intensities.ndim == 2 and intensities.shape[1] != len(times):
+        intensities = intensities[:, : len(times)]
+
+    return wavenumbers, *_filter_positive_times(times, intensities)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data descriptors
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Slice:
+    """One draggable selector line on the heatmap."""
+    _id_counter = 0
+
+    def __init__(self, kind: str, index: int, color: str, label: str = ""):
+        Slice._id_counter += 1
+        self.uid = Slice._id_counter
+        self.kind = kind          # "vertical" | "horizontal"
+        self.index = index
+        self.color = color
+        self.label = label or f"{'W' if kind == 'vertical' else 'T'}{self.uid}"
+        self.line_obj: Optional[Line2D] = None
+        self.visible = True
+
+
+class Region:
+    """
+    Rectangular selection on the heatmap (index ranges).
+
+    ti0, ti1  – time-axis indices      (ti0 <= ti1)
+    wi0, wi1  – wavenumber indices     (wi0 <= wi1)
+    """
+    _id_counter = 0
+
+    def __init__(self, ti0: int, ti1: int, wi0: int, wi1: int,
+                 color: str, label: str = ""):
+        Region._id_counter += 1
+        self.uid = Region._id_counter
+        self.ti0, self.ti1 = ti0, ti1
+        self.wi0, self.wi1 = wi0, wi1
+        self.color = color
+        self.label = label or f"R{self.uid}"
+        self.rect_obj: Optional[Rectangle] = None
+        self.visible = True
+        self.detail_window: Optional[RegionPlotWindow] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PlotPanel  –  incremental-update plot abstraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PlotPanel:
+    """
+    Embeds one matplotlib Figure/Axes in *parent_frame* and maintains a
+    mapping  uid → Line2D  so that data updates are incremental.
+
+    Public API
+    ----------
+    upsert(uid, xdata, ydata, **line_kwargs)
+        Create or update the line identified by *uid*.
+    remove(uid)
+        Remove the line and trigger a full axes redraw (necessary only on
+        delete, which is infrequent).
+    clear()
+        Remove every managed line.
+    redraw()
+        Flush pending draw_idle calls.
+    set_labels(xlabel, ylabel, title)
+        Update axes labels without clearing lines.
+    """
+
+    def __init__(self, parent_frame: tk.Widget,
+                 xlabel: str, ylabel: str, title: str,
+                 figsize: tuple[float, float] = (4, 3)):
+        self._xlabel = xlabel
+        self._ylabel = ylabel
+        self._title = title
+
+        self.fig, self.ax = plt.subplots(figsize=figsize, facecolor=T.BG_FIGURE)
+        _style_axes(self.ax, xlabel, ylabel, title)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=parent_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # uid → Line2D
+        self._lines: dict[int, Line2D] = {}
+        # track whether the legend needs refreshing
+        self._legend_labels: dict[int, str] = {}
+
+    # ── line management ───────────────────────────────────────────────────
+
+    def upsert(self, uid: int,
+               xdata: np.ndarray, ydata: np.ndarray,
+               label: str = "",
+               color: str = "#888888",
+               lw: float = 1.4,
+               ls: str = "-",
+               visible: bool = True) -> Line2D:
+        """Create or update the line for *uid*; returns the Line2D."""
+        if uid in self._lines:
+            line = self._lines[uid]
+            line.set_data(xdata, ydata)
+            line.set_color(color)
+            line.set_linewidth(lw)
+            line.set_linestyle(ls)
+            line.set_visible(visible)
+            if label:
+                line.set_label(label)
+        else:
+            (line,) = self.ax.plot(xdata, ydata,
+                                   color=color, lw=lw, ls=ls,
+                                   label=label, visible=visible)
+            self._lines[uid] = line
+
+        self._legend_labels[uid] = label
+        self._rescale()
+        return line
+
+    def remove(self, uid: int):
+        """Remove a line by uid and do a full redraw (infrequent)."""
+        line = self._lines.pop(uid, None)
+        self._legend_labels.pop(uid, None)
+        if line is not None:
+            try:
+                line.remove()
+            except Exception:
+                pass
+        self._rebuild_legend()
+        self._rescale()
+        self.canvas.draw_idle()
+
+    def clear(self):
+        """Remove all managed lines."""
+        for uid in list(self._lines):
+            self.remove(uid)
+
+    def redraw(self):
+        """Flush any pending draw."""
+        self._rebuild_legend()
+        self.canvas.draw_idle()
+
+    def set_labels(self, xlabel: str, ylabel: str, title: str):
+        self._xlabel = xlabel
+        _style_axes(self.ax, xlabel, ylabel, title)
+
+    def bind_motion(self, callback):
+        """Convenience: connect a motion_notify_event."""
+        self.fig.canvas.mpl_connect("motion_notify_event", callback)
+
+    # ── internal ──────────────────────────────────────────────────────────
+
+    def _rescale(self):
+        self.ax.relim()
+        self.ax.autoscale_view()
+
+    def _rebuild_legend(self):
+        visible_lines = [l for l in self._lines.values()
+                         if l.get_visible() and l.get_label()]
+        if visible_lines:
+            self.ax.legend(
+                handles=visible_lines,
+                fontsize=T.FONT_SIZE_SMALL,
+                facecolor=T.BG_PANEL,
+                labelcolor=T.FG_LABEL,
+                edgecolor=T.COLOR_SPINE,
+            )
+        else:
+            legend = self.ax.get_legend()
+            if legend:
+                legend.remove()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RegionPlotWindow  –  per-region detail window
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RegionPlotWindow:
+    """
+    A floating ``tk.Toplevel`` that shows the averaged spectrum and averaged
+    time trace for one :class:`Region`.  Refreshes incrementally via its own
+    two :class:`PlotPanel` instances.
+    """
+
+    def __init__(self, parent: tk.Tk, region: Region,
+                 wavenumbers: np.ndarray, times: np.ndarray,
+                 intensity: np.ndarray):
+        self._region = region
+        self._wn = wavenumbers
+        self._t = times
+        self._Z = intensity
+
+        top = tk.Toplevel(parent)
+        top.title(f"Region {region.label} – detail")
+        top.geometry("600x540")
+        top.configure(bg=T.BG_APP)
+        self._top = top
+        top.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        paned = tk.PanedWindow(top, orient=tk.VERTICAL,
+                               bg=T.COLOR_SASH, sashwidth=5)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        spec_frame = tk.Frame(paned, bg=T.BG_APP)
+        paned.add(spec_frame, minsize=200)
+        self._spec_panel = PlotPanel(
+            spec_frame,
+            xlabel="Wavenumber (cm⁻¹)", ylabel="Intensity",
+            title=f"[{region.label}] Mean spectrum",
+        )
+
+        time_frame = tk.Frame(paned, bg=T.BG_APP)
+        paned.add(time_frame, minsize=200)
+        self._time_panel = PlotPanel(
+            time_frame,
+            xlabel="Time (s)", ylabel="Intensity",
+            title=f"[{region.label}] Mean time trace",
+        )
+
+        self.refresh()
+
+    # ── public ────────────────────────────────────────────────────────────
+
+    def refresh(self):
+        """Recompute averaged data for the current region bounds and update plots."""
+        rg = self._region
+        wn = self._wn
+        t = self._t
+        Z = self._Z
+        if Z.size == 0:
+            return
+
+        # averaged spectrum  (mean over time axis of the region)
+        mean_spec = np.nanmean(Z[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=1)
+        t_lo, t_hi = t[rg.ti0], t[rg.ti1]
+        self._spec_panel.upsert(
+            uid=0,
+            xdata=wn[rg.wi0:rg.wi1 + 1],
+            ydata=mean_spec,
+            label=f"t:[{t_lo:.3g},{t_hi:.3g}]",
+            color=rg.color, lw=2.0, ls="-.",
+        )
+        self._spec_panel.set_labels(
+            "Wavenumber (cm⁻¹)", "Intensity",
+            f"[{rg.label}] Mean spectrum  t:[{t_lo:.3g},{t_hi:.3g}]",
+        )
+        self._spec_panel.redraw()
+
+        # averaged time trace (mean over wavenumber axis of the region)
+        mean_trace = np.nanmean(Z[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=0)
+        w_lo = wn[min(rg.wi0, rg.wi1)]
+        w_hi = wn[max(rg.wi0, rg.wi1)]
+        self._time_panel.upsert(
+            uid=0,
+            xdata=t[rg.ti0:rg.ti1 + 1],
+            ydata=mean_trace,
+            label=f"wn:[{w_lo:.1f},{w_hi:.1f}]",
+            color=rg.color, lw=2.0, ls="-.",
+        )
+        self._time_panel.set_labels(
+            "Time (s)", "Intensity",
+            f"[{rg.label}] Mean time trace  wn:[{w_lo:.1f},{w_hi:.1f}]",
+        )
+        self._time_panel.redraw()
+
+    def update_color(self):
+        """Called when the region color changes."""
+        rg = self._region
+        for panel in (self._spec_panel, self._time_panel):
+            line = panel._lines.get(0)
+            if line is not None:
+                line.set_color(rg.color)
+                panel.redraw()
+
+    def destroy(self):
+        try:
+            self._top.destroy()
+        except Exception:
+            pass
+
+    # ── internal ──────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        self._region.detail_window = None
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AnalysisWindow
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AnalysisWindow:
 
-    # interaction modes
-    MODE_SLICE  = "slice"   # default – drag existing slice lines
-    MODE_REGION = "region"  # draw new rectangle with press+drag
+    MODE_SLICE  = "slice"
+    MODE_REGION = "region"
 
     def __init__(self, root: tk.Tk, path: str):
         self.root = root
@@ -198,11 +441,12 @@ class AnalysisWindow:
         self._focused_region: Optional[Region] = None
         self._region_widgets: dict[int, dict] = {}
 
-        # draw-region state
+        # draw-region transient state
         self._mode = self.MODE_SLICE
         self._draw_start: Optional[tuple[float, float]] = None
         self._draw_rect_patch: Optional[Rectangle] = None
 
+        # heatmap state
         self._cmap = T.DEFAULT_CMAP
         self._cbar = None
         self._heatmap_img = None
@@ -210,9 +454,9 @@ class AnalysisWindow:
         self._build_ui()
         self._load_data()
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     # UI construction
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         r = self.root
@@ -221,7 +465,7 @@ class AnalysisWindow:
         r.minsize(900, 640)
         r.configure(bg=T.BG_APP)
 
-        # top toolbar
+        # ── top toolbar ──────────────────────────────────────────────────
         toolbar = tk.Frame(r, bg=T.BG_TOOLBAR, pady=5)
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
@@ -273,17 +517,18 @@ class AnalysisWindow:
                  bg=T.BG_TOOLBAR, fg=T.FG_SUBTLE,
                  font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.RIGHT, padx=12)
 
-        # main paned: heatmap left / plots right
+        # ── main paned: heatmap left / plots right ───────────────────────
         paned = tk.PanedWindow(r, orient=tk.HORIZONTAL,
                                bg=T.COLOR_SASH, sashwidth=6, sashrelief=tk.FLAT)
         paned.pack(fill=tk.BOTH, expand=True)
 
+        # left – heatmap
         left = tk.Frame(paned, bg=T.BG_APP)
         paned.add(left, minsize=400)
 
         self._fig_heat, self._ax_heat = plt.subplots(figsize=(6, 5),
                                                       facecolor=T.BG_FIGURE)
-        _style_axes(self._ax_heat, "Time", "Wavenumber (cm-1)",
+        _style_axes(self._ax_heat, "Time (s)", "Wavenumber (cm⁻¹)",
                     "Raman Intensity Heatmap")
         self._canvas_heat = FigureCanvasTkAgg(self._fig_heat, master=left)
         self._canvas_heat.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -293,6 +538,7 @@ class AnalysisWindow:
         self._fig_heat.canvas.mpl_connect("button_release_event", self._on_heat_release)
         self._fig_heat.canvas.mpl_connect("scroll_event",         self._on_heat_scroll)
 
+        # right – two PlotPanels stacked vertically
         right = tk.Frame(paned, bg=T.BG_APP)
         paned.add(right, minsize=340)
 
@@ -302,26 +548,23 @@ class AnalysisWindow:
 
         spec_frame = tk.Frame(right_paned, bg=T.BG_APP)
         right_paned.add(spec_frame, minsize=200)
-        self._fig_spec, self._ax_spec = plt.subplots(figsize=(4, 3),
-                                                      facecolor=T.BG_FIGURE)
-        _style_axes(self._ax_spec, "Wavenumber (cm-1)", "Intensity",
-                    "Spectra (V-slices / regions)")
-        self._canvas_spec = FigureCanvasTkAgg(self._fig_spec, master=spec_frame)
-        self._canvas_spec.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._spec_panel = PlotPanel(
+            spec_frame,
+            xlabel="Wavenumber (cm⁻¹)", ylabel="Intensity",
+            title="Spectra (V-slices)",
+        )
+        self._spec_panel.bind_motion(self._on_spec_motion)
 
         time_frame = tk.Frame(right_paned, bg=T.BG_APP)
         right_paned.add(time_frame, minsize=200)
-        self._fig_time, self._ax_time = plt.subplots(figsize=(4, 3),
-                                                      facecolor=T.BG_FIGURE)
-        _style_axes(self._ax_time, "Time", "Intensity",
-                    "Time traces (H-slices / regions)")
-        self._canvas_time = FigureCanvasTkAgg(self._fig_time, master=time_frame)
-        self._canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._time_panel = PlotPanel(
+            time_frame,
+            xlabel="Time (s)", ylabel="Intensity",
+            title="Time traces (H-slices)",
+        )
+        self._time_panel.bind_motion(self._on_time_motion)
 
-        self._fig_spec.canvas.mpl_connect("motion_notify_event", self._on_spec_motion)
-        self._fig_time.canvas.mpl_connect("motion_notify_event", self._on_time_motion)
-
-        # bottom bar: slices row + regions row
+        # ── bottom bar ───────────────────────────────────────────────────
         bottom = tk.Frame(r, bg=T.BG_SLICE_BAR)
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
 
@@ -350,9 +593,9 @@ class AnalysisWindow:
         r.bind("<Delete>", lambda e: self._remove_focused())
         r.bind("<Escape>", lambda e: self._escape_pressed())
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     # Data loading
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
 
     def _load_data(self):
         try:
@@ -371,9 +614,9 @@ class AnalysisWindow:
         self._add_vertical_slice()
         self._add_horizontal_slice()
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     # Heatmap rendering
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
 
     def _refresh_heatmap(self):
         if self.intensity.size == 0:
@@ -382,9 +625,8 @@ class AnalysisWindow:
             self._cbar.remove()
         self._cmap = self._cmap_var.get()
         ax = self._ax_heat
-        fig = self._fig_heat
         ax.cla()
-        _style_axes(ax, "Time (s)", "Wavenumber (cm-1)", "Raman Intensity Heatmap")
+        _style_axes(ax, "Time (s)", "Wavenumber (cm⁻¹)", "Raman Intensity Heatmap")
         t0, t1 = self.times[0], self.times[-1]
         w0, w1 = self.wavenumbers[0], self.wavenumbers[-1]
         self._heatmap_img = ax.imshow(
@@ -393,9 +635,8 @@ class AnalysisWindow:
             extent=[t0, t1, w0, w1],
             cmap=self._cmap, interpolation="none",
         )
-
-        self._cbar = fig.colorbar(self._heatmap_img, ax=ax, location="right")
-
+        self._cbar = self._fig_heat.colorbar(self._heatmap_img, ax=ax, location="right")
+        # Redraw slice lines and region rects on top of the new heatmap
         for s in self.slices:
             s.line_obj = None
             self._draw_slice_line(s)
@@ -453,9 +694,46 @@ class AnalysisWindow:
             rg.rect_obj.set_alpha(alpha_fill)
         rg.rect_obj.set_visible(rg.visible)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # PlotPanel update helpers
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _upsert_slice_in_panel(self, s: Slice):
+        """Push the current slice data into the correct PlotPanel."""
+        if not s.visible or self.intensity.size == 0:
+            # hide the line without removing it (keeps uid slot alive)
+            panel = self._spec_panel if s.kind == "vertical" else self._time_panel
+            if s.uid in panel._lines:
+                panel._lines[s.uid].set_visible(False)
+                panel.redraw()
+            return
+
+        if s.kind == "vertical":
+            xdata = self.wavenumbers
+            ydata = self.intensity[:, s.index]
+            label = f"{s.label}  t={self.times[s.index]:.3g}"
+            self._spec_panel.upsert(
+                s.uid, xdata, ydata,
+                label=label, color=s.color, lw=1.4, ls="-", visible=True,
+            )
+            self._spec_panel.redraw()
+        else:
+            xdata = self.times
+            ydata = self.intensity[s.index, :]
+            label = f"{s.label}  wn={self.wavenumbers[s.index]:.1f}"
+            self._time_panel.upsert(
+                s.uid, xdata, ydata,
+                label=label, color=s.color, lw=1.4, ls="-", visible=True,
+            )
+            self._time_panel.redraw()
+
+    def _remove_slice_from_panel(self, s: Slice):
+        panel = self._spec_panel if s.kind == "vertical" else self._time_panel
+        panel.remove(s.uid)
+
+    # ─────────────────────────────────────────────────────────────────────
     # Slice management
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
 
     def _used_colors(self) -> list[str]:
         return [s.color for s in self.slices] + [rg.color for rg in self.regions]
@@ -468,7 +746,7 @@ class AnalysisWindow:
         self._focused_slice = s
         self._focused_region = None
         self._rebuild_slice_list()
-        self._refresh_spectrum_plot()
+        self._upsert_slice_in_panel(s)
 
     def _add_horizontal_slice(self):
         idx = len(self.wavenumbers) // 2 if self.wavenumbers.size else 0
@@ -478,18 +756,16 @@ class AnalysisWindow:
         self._focused_slice = s
         self._focused_region = None
         self._rebuild_slice_list()
-        self._refresh_time_plot()
+        self._upsert_slice_in_panel(s)
 
     def _set_focused_slice(self, s: Optional[Slice]):
         prev_sl = self._focused_slice
         prev_rg = self._focused_region
         self._focused_slice = s
         self._focused_region = None
-        # deselect old region
         if prev_rg is not None:
             self._draw_region_rect(prev_rg)
             self._update_region_widgets(prev_rg)
-        # update old and new slice border
         for sl in [prev_sl, s]:
             if sl is not None:
                 self._draw_slice_line(sl)
@@ -504,10 +780,7 @@ class AnalysisWindow:
         s.index = int(np.clip(s.index + delta, 0, len(arr) - 1))
         self._draw_slice_line(s)
         self._canvas_heat.draw_idle()
-        if s.kind == "vertical":
-            self._refresh_spectrum_plot()
-        else:
-            self._refresh_time_plot()
+        self._upsert_slice_in_panel(s)
         self._update_slice_widgets(s)
 
     def _remove_focused(self):
@@ -527,27 +800,25 @@ class AnalysisWindow:
             self._focused_slice = None
         self._canvas_heat.draw_idle()
         self._rebuild_slice_list()
-        self._refresh_spectrum_plot()
-        self._refresh_time_plot()
+        self._remove_slice_from_panel(s)
 
     def _escape_pressed(self):
         if self._mode == self.MODE_REGION and self._draw_start is not None:
             self._cancel_draw()
-        else:
-            if self._focused_slice is not None:
-                self._set_focused_slice(None)
-            elif self._focused_region is not None:
-                self._set_focused_region(None)
+        elif self._focused_slice is not None:
+            self._set_focused_slice(None)
+        elif self._focused_region is not None:
+            self._set_focused_region(None)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     # Region management
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
 
     def _toggle_region_mode(self):
         if self._mode == self.MODE_SLICE:
             self._mode = self.MODE_REGION
             self._region_btn.configure(bg="#fde047", fg="#713f12")
-            self._region_btn_text.set("[ ] Drawing... (click+drag)")
+            self._region_btn_text.set("[ ] Drawing… (click+drag)")
             self._canvas_heat.get_tk_widget().configure(cursor="crosshair")
         else:
             self._cancel_draw()
@@ -584,8 +855,8 @@ class AnalysisWindow:
         self._focused_region = rg
         self._focused_slice = None
         self._rebuild_region_list()
-        self._refresh_spectrum_plot()
-        self._refresh_time_plot()
+        # open a detail window automatically for the new region
+        self._open_region_detail(rg)
         self._canvas_heat.draw_idle()
 
     def _set_focused_region(self, rg: Optional[Region]):
@@ -608,17 +879,31 @@ class AnalysisWindow:
                 rg.rect_obj.remove()
             except Exception:
                 pass
+        if rg.detail_window is not None:
+            rg.detail_window.destroy()
+            rg.detail_window = None
         self.regions.remove(rg)
         if self._focused_region is rg:
             self._focused_region = None
         self._canvas_heat.draw_idle()
         self._rebuild_region_list()
-        self._refresh_spectrum_plot()
-        self._refresh_time_plot()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Heatmap mouse interaction
-    # ─────────────────────────────────────────────────────────────────────────
+    def _open_region_detail(self, rg: Region):
+        """Open (or bring to front) the detail window for *rg*."""
+        if rg.detail_window is not None:
+            try:
+                rg.detail_window._top.lift()
+                return
+            except Exception:
+                rg.detail_window = None
+        rg.detail_window = RegionPlotWindow(
+            self.root, rg,
+            self.wavenumbers, self.times, self.intensity,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Heatmap mouse events
+    # ─────────────────────────────────────────────────────────────────────
 
     def _nearest_slice(self, event) -> Optional[Slice]:
         if event.xdata is None or event.ydata is None:
@@ -656,14 +941,12 @@ class AnalysisWindow:
             self._ax_heat.add_patch(self._draw_rect_patch)
             return
 
-        # MODE_SLICE
         s = self._nearest_slice(event)
         if s is not None:
             self._drag_slice = s
             self._set_focused_slice(s)
             return
 
-        # check region hit
         for rg in self.regions:
             t_lo = self.times[rg.ti0]
             t_hi = self.times[rg.ti1]
@@ -673,7 +956,6 @@ class AnalysisWindow:
                 self._set_focused_region(rg)
                 return
 
-        # empty click – deselect all
         self._set_focused_slice(None)
 
     def _on_heat_motion(self, event):
@@ -688,7 +970,6 @@ class AnalysisWindow:
         self._info_var.set(
             f"t={self.times[ti]:.3g}  wn={self.wavenumbers[wi]:.1f}  I={val:.4g}")
 
-        # live rect preview
         if self._mode == self.MODE_REGION and self._draw_start is not None:
             x0, y0 = self._draw_start
             x1, y1 = event.xdata, event.ydata
@@ -699,7 +980,6 @@ class AnalysisWindow:
                 self._canvas_heat.draw_idle()
             return
 
-        # slice drag
         if self._drag_slice is not None:
             s = self._drag_slice
             if s.kind == "vertical":
@@ -712,10 +992,7 @@ class AnalysisWindow:
                 s.index = idx
                 self._draw_slice_line(s)
                 self._canvas_heat.draw_idle()
-                if s.kind == "vertical":
-                    self._refresh_spectrum_plot()
-                else:
-                    self._refresh_time_plot()
+                self._upsert_slice_in_panel(s)
                 self._update_slice_widgets(s)
 
     def _on_heat_release(self, event):
@@ -726,7 +1003,6 @@ class AnalysisWindow:
                 self._commit_region(x0, event.xdata, y0, event.ydata)
             else:
                 self._cancel_draw()
-            # auto-return to slice mode
             self._mode = self.MODE_SLICE
             self._region_btn.configure(bg="#fef9c3", fg="#854d0e")
             self._region_btn_text.set("[ ] Draw region")
@@ -738,12 +1014,12 @@ class AnalysisWindow:
         delta = 1 if event.button == "up" else -1
         self._nudge_focused(delta)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Crosshair info in side panels
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # Side panel crosshair info
+    # ─────────────────────────────────────────────────────────────────────
 
     def _on_spec_motion(self, event):
-        if event.inaxes != self._ax_spec or event.xdata is None:
+        if event.inaxes != self._spec_panel.ax or event.xdata is None:
             return
         wi = int(np.clip(np.searchsorted(self.wavenumbers, event.xdata),
                          0, len(self.wavenumbers) - 1))
@@ -752,11 +1028,9 @@ class AnalysisWindow:
             self._info_var.set(
                 f"wn={self.wavenumbers[wi]:.1f}  "
                 f"I_min={np.nanmin(row):.4g}  I_max={np.nanmax(row):.4g}")
-        else:
-            self._info_var.set(f"wn={event.xdata:.1f}")
 
     def _on_time_motion(self, event):
-        if event.inaxes != self._ax_time or event.xdata is None:
+        if event.inaxes != self._time_panel.ax or event.xdata is None:
             return
         ti = int(np.clip(np.searchsorted(self.times, event.xdata),
                          0, len(self.times) - 1))
@@ -765,78 +1039,10 @@ class AnalysisWindow:
             self._info_var.set(
                 f"t={self.times[ti]:.3g}  "
                 f"I_min={np.nanmin(col):.4g}  I_max={np.nanmax(col):.4g}")
-        else:
-            self._info_var.set(f"t={event.xdata:.3g}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Right-panel plots  (slices + regions combined)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _refresh_spectrum_plot(self):
-        ax = self._ax_spec
-        ax.cla()
-        _style_axes(ax, "Wavenumber (cm-1)", "Intensity",
-                    "Spectra (V-slices / regions)")
-        has_legend = False
-
-        for s in self.slices:
-            if s.kind != "vertical" or not s.visible or self.intensity.size == 0:
-                continue
-            ax.plot(self.wavenumbers, self.intensity[:, s.index],
-                    color=s.color, lw=1.4, ls="-",
-                    label=f"{s.label}  t={self.times[s.index]:.3g}")
-            has_legend = True
-
-        for rg in self.regions:
-            if not rg.visible or self.intensity.size == 0:
-                continue
-            mean_spec = np.nanmean(self.intensity[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=1)
-            t_lo = self.times[rg.ti0]
-            t_hi = self.times[rg.ti1]
-            ax.plot(self.wavenumbers[rg.wi0:rg.wi1 + 1], mean_spec,
-                    color=rg.color, lw=2.0, ls="-.",
-                    label=f"{rg.label} t:[{t_lo:.3f},{t_hi:.3f}]")
-            has_legend = True
-
-        if has_legend:
-            ax.legend(fontsize=T.FONT_SIZE_SMALL, facecolor=T.BG_PANEL,
-                      labelcolor=T.FG_LABEL, edgecolor=T.COLOR_SPINE)
-        self._canvas_spec.draw_idle()
-
-    def _refresh_time_plot(self):
-        ax = self._ax_time
-        ax.cla()
-        _style_axes(ax, "Time (s)", "Intensity",
-                    "Time traces (H-slices / regions)")
-        has_legend = False
-
-        for s in self.slices:
-            if s.kind != "horizontal" or not s.visible or self.intensity.size == 0:
-                continue
-            ax.plot(self.times, self.intensity[s.index, :],
-                    color=s.color, lw=1.4, ls="-",
-                    label=f"{s.label}  wn={self.wavenumbers[s.index]:.1f}")
-            has_legend = True
-
-        for rg in self.regions:
-            if not rg.visible or self.intensity.size == 0:
-                continue
-            mean_trace = np.nanmean(self.intensity[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=0)
-            w_lo = self.wavenumbers[rg.wi0]
-            w_hi = self.wavenumbers[rg.wi1]
-            ax.plot(self.times[rg.ti0:rg.ti1 + 1], mean_trace,
-                    color=rg.color, lw=2.0, ls="-.",
-                    label=f"{rg.label} wn:[{w_lo:.1f},{w_hi:.1f}]")
-            has_legend = True
-
-        if has_legend:
-            ax.legend(fontsize=T.FONT_SIZE_SMALL, facecolor=T.BG_PANEL,
-                      labelcolor=T.FG_LABEL, edgecolor=T.COLOR_SPINE)
-        self._canvas_time.draw_idle()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Slice list bar  (stable widget cache)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # Slice list bar
+    # ─────────────────────────────────────────────────────────────────────
 
     def _rebuild_slice_list(self):
         for w in self._slice_list_frame.winfo_children():
@@ -896,21 +1102,19 @@ class AnalysisWindow:
             s.color = color[1]
             self._draw_slice_line(s)
             self._canvas_heat.draw_idle()
-            self._refresh_spectrum_plot()
-            self._refresh_time_plot()
+            self._upsert_slice_in_panel(s)
             self._update_slice_widgets(s)
 
     def _toggle_slice_visible(self, s: Slice):
         s.visible = not s.visible
         self._draw_slice_line(s)
         self._canvas_heat.draw_idle()
-        self._refresh_spectrum_plot()
-        self._refresh_time_plot()
+        self._upsert_slice_in_panel(s)
         self._update_slice_widgets(s)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Region list bar  (same stable-widget-cache pattern)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # Region list bar
+    # ─────────────────────────────────────────────────────────────────────
 
     def _rebuild_region_list(self):
         for w in self._region_list_frame.winfo_children():
@@ -947,6 +1151,12 @@ class AnalysisWindow:
         vis_btn.pack(side=tk.LEFT)
         vis_btn.bind("<Button-1>", lambda e, r=rg: self._toggle_region_visible(r))
 
+        open_btn = tk.Label(row, text=" ⊞",
+                            bg=T.BG_PANEL, fg="#0284c7",
+                            font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
+        open_btn.pack(side=tk.LEFT)
+        open_btn.bind("<Button-1>", lambda e, r=rg: self._open_region_detail(r))
+
         del_btn = tk.Label(row, text=" x",
                            bg=T.BG_PANEL, fg="#ef4444",
                            font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
@@ -981,25 +1191,24 @@ class AnalysisWindow:
             rg.color = color[1]
             self._draw_region_rect(rg)
             self._canvas_heat.draw_idle()
-            self._refresh_spectrum_plot()
-            self._refresh_time_plot()
+            if rg.detail_window is not None:
+                rg.detail_window.update_color()
             self._update_region_widgets(rg)
 
     def _toggle_region_visible(self, rg: Region):
         rg.visible = not rg.visible
         self._draw_region_rect(rg)
         self._canvas_heat.draw_idle()
-        self._refresh_spectrum_plot()
-        self._refresh_time_plot()
         self._update_region_widgets(rg)
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_analysis_window(csv_path: str):
     root = tk.Tk()
-    # root.iconphoto(True, tk.PhotoImage(file="canvas.png"))
-    app = AnalysisWindow(root, csv_path)
+    AnalysisWindow(root, csv_path)
     root.mainloop()
 
 
