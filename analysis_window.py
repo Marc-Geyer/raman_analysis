@@ -790,12 +790,12 @@ class AnalysisWindow:
         for rg in self.regions:
             if not rg.visible or self.intensity.size == 0:
                 continue
-            mean_spec = np.nanmean(self.intensity[:, rg.ti0:rg.ti1 + 1], axis=1)
+            mean_spec = np.nanmean(self.intensity[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=1)
             t_lo = self.times[rg.ti0]
             t_hi = self.times[rg.ti1]
-            ax.plot(self.wavenumbers, mean_spec,
+            ax.plot(self.wavenumbers[rg.wi0:rg.wi1 + 1], mean_spec,
                     color=rg.color, lw=2.0, ls="-.",
-                    label=f"{rg.label} t:[{t_lo:.3g},{t_hi:.3g}]")
+                    label=f"{rg.label} t:[{t_lo:.3f},{t_hi:.3f}]")
             has_legend = True
 
         if has_legend:
@@ -821,10 +821,10 @@ class AnalysisWindow:
         for rg in self.regions:
             if not rg.visible or self.intensity.size == 0:
                 continue
-            mean_trace = np.nanmean(self.intensity[rg.wi0:rg.wi1 + 1, :], axis=0)
+            mean_trace = np.nanmean(self.intensity[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=0)
             w_lo = self.wavenumbers[rg.wi0]
             w_hi = self.wavenumbers[rg.wi1]
-            ax.plot(self.times, mean_trace,
+            ax.plot(self.times[rg.ti0:rg.ti1 + 1], mean_trace,
                     color=rg.color, lw=2.0, ls="-.",
                     label=f"{rg.label} wn:[{w_lo:.1f},{w_hi:.1f}]")
             has_legend = True
