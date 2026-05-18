@@ -13,14 +13,29 @@ Layout (main window)
   │  Vertical slice / region boundaries mirrored as        │
   │  dashed marker lines on the echem time axis.           │
   └────────────────────────────────────────────────────────┘
-  Bottom: slice bar / region bar
+  Bottom: slice bar / region bar  (always visible)
+
+Performance notes
+-----------------
+* Heatmap drag uses matplotlib blit animation: on drag start the canvas
+  background is captured (minus the slice/region artists), and each
+  motion event restores that bitmap then redraws only the moving
+  artists via ax.draw_artist() + canvas.blit().  No full rasterise
+  occurs until the drag ends or the heatmap itself changes.
+
+* Side-panel (spectrum/time) updates during drag are throttled to at
+  most one redraw every SIDE_PANEL_THROTTLE_MS milliseconds so that
+  fast mouse movements do not queue a backlog of expensive redraws.
+
+* PlotPanel uses uid→Line2D caches and set_data() / set_xdata() /
+  set_ydata() incremental updates — never cla().
 
 Key classes
 -----------
 PlotPanel
     Owns one Figure/Axes in a Tk frame.  Maintains uid→Line2D so that
     updates call set_data()+relim instead of cla().  Also manages a
-    separate uid→axvline dict for time-marker synchronisation.
+    separate uid→Line2D dict for time-marker synchronisation.
 
 EchemData
     Parsed contents of one xlsx sheet: time, potential, uv arrays.
@@ -41,6 +56,7 @@ from __future__ import annotations
 import os
 import sys
 import csv
+import time
 import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, colorchooser, filedialog
@@ -57,6 +73,11 @@ from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 
 import theme as T
+
+
+# How many milliseconds must elapse between side-panel redraws during drag.
+# Lower = more responsive but more CPU; 40 ms ≈ 25 fps which feels live.
+SIDE_PANEL_THROTTLE_MS: int = 40
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,6 +648,7 @@ class AnalysisWindow:
         self.wavenumbers: np.ndarray = np.array([])
         self.times:       np.ndarray = np.array([])
         self.intensity:   np.ndarray = np.array([])
+        self.max_intensity:    float = 1.0
 
         self.slices:         list[Slice]        = []
         self._drag_slice:    Optional[Slice]    = None
@@ -647,6 +669,11 @@ class AnalysisWindow:
 
         self._echem_sheets: dict[str, EchemData] = {}
         self._echem_path:   Optional[str]         = None
+
+        # ── blit / drag performance state ─────────────────────────────────
+        self._heat_bg:            Optional[object] = None
+        self._blit_artists:       list              = []
+        self._last_side_redraw_t: float             = 0.0
 
         self._build_ui()
         self._load_data()
@@ -747,7 +774,35 @@ class AnalysisWindow:
                  bg="#f0fdf4", fg=T.FG_SUBTLE,
                  font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT, padx=6)
 
+        # ── bottom bar ────────────────────────────────────────────────────
+        # IMPORTANT: pack the bottom bar BEFORE the expanding PanedWindow.
+        # Tk's pack geometry manager allocates space to side=BOTTOM widgets
+        # first (in reverse pack order for BOTTOM), so by packing this before
+        # the main paned window we guarantee it always gets its natural height
+        # and is never squeezed out when the window is small.
+        bottom = tk.Frame(r, bg=T.BG_SLICE_BAR)
+        bottom.pack(fill=tk.X, side=tk.BOTTOM)
+
+        sr = tk.Frame(bottom, bg=T.BG_SLICE_BAR, pady=3)
+        sr.pack(fill=tk.X)
+        tk.Label(sr, text=" Slices: ",
+                 bg=T.BG_SLICE_BAR, fg=T.FG_SUBTLE,
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT)
+        self._slice_list_frame = tk.Frame(sr, bg=T.BG_SLICE_BAR)
+        self._slice_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        _RRB = "#fefce8"
+        rr = tk.Frame(bottom, bg=_RRB, pady=3)
+        rr.pack(fill=tk.X)
+        tk.Label(rr, text=" Regions:",
+                 bg=_RRB, fg=T.FG_SUBTLE,
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT)
+        self._region_list_frame = tk.Frame(rr, bg=_RRB)
+        self._region_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._REGION_ROW_BG = _RRB
+
         # ── outer vertical paned: upper (heatmap+side) / lower (echem) ───
+        # Packed AFTER bottom so the paned window fills remaining space only.
         outer = tk.PanedWindow(r, orient=tk.VERTICAL,
                                bg=T.COLOR_SASH, sashwidth=6)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -760,19 +815,39 @@ class AnalysisWindow:
                                bg=T.COLOR_SASH, sashwidth=6, sashrelief=tk.FLAT)
         paned.pack(fill=tk.BOTH, expand=True)
 
-        left = tk.Frame(paned, bg=T.BG_APP)
+        left = tk.PanedWindow(paned, orient=tk.VERTICAL,
+                               bg=T.COLOR_SASH, sashwidth=6, sashrelief=tk.FLAT)
         paned.add(left, minsize=400)
+
+        heat_frame = tk.Frame(left, bg=T.BG_APP)
+        left.add(heat_frame, minsize=400)
 
         self._fig_heat, self._ax_heat = plt.subplots(figsize=(6, 5),
                                                       facecolor=T.BG_FIGURE)
         _style_axes(self._ax_heat, "Time (s)", "Wavenumber (cm⁻¹)",
                     "Raman Intensity Heatmap")
-        self._canvas_heat = FigureCanvasTkAgg(self._fig_heat, master=left)
+        self._canvas_heat = FigureCanvasTkAgg(self._fig_heat, master=heat_frame)
         self._canvas_heat.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._fig_heat.canvas.mpl_connect("button_press_event",   self._on_heat_press)
         self._fig_heat.canvas.mpl_connect("motion_notify_event",  self._on_heat_motion)
         self._fig_heat.canvas.mpl_connect("button_release_event", self._on_heat_release)
         self._fig_heat.canvas.mpl_connect("scroll_event",         self._on_heat_scroll)
+
+        # lower half – echem
+        echem_outer = tk.Frame(left, bg=T.BG_APP)
+        left.add(echem_outer, minsize=220)
+
+        echem_hdr = tk.Frame(echem_outer, bg="#f0fdf4", pady=2)
+        echem_hdr.pack(fill=tk.X)
+        tk.Label(echem_hdr, text="  Electrochemistry",
+                 bg="#f0fdf4", fg="#166534",
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL, "bold")).pack(side=tk.LEFT)
+        self._echem_sheet_lbl = tk.StringVar(value="")
+        tk.Label(echem_hdr, textvariable=self._echem_sheet_lbl,
+                 bg="#f0fdf4", fg=T.FG_SUBTLE,
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT, padx=6)
+
+        self._echem_panel = EchemPanel(echem_outer)
 
         right = tk.Frame(paned, bg=T.BG_APP)
         paned.add(right, minsize=340)
@@ -794,44 +869,6 @@ class AnalysisWindow:
                                      xlabel="Time (s)", ylabel="Intensity",
                                      title="Time traces (H-slices)")
         self._time_panel.bind_motion(self._on_time_motion)
-
-        # lower half – echem
-        echem_outer = tk.Frame(outer, bg=T.BG_APP)
-        outer.add(echem_outer, minsize=220)
-
-        echem_hdr = tk.Frame(echem_outer, bg="#f0fdf4", pady=2)
-        echem_hdr.pack(fill=tk.X)
-        tk.Label(echem_hdr, text="  Electrochemistry",
-                 bg="#f0fdf4", fg="#166534",
-                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL, "bold")).pack(side=tk.LEFT)
-        self._echem_sheet_lbl = tk.StringVar(value="")
-        tk.Label(echem_hdr, textvariable=self._echem_sheet_lbl,
-                 bg="#f0fdf4", fg=T.FG_SUBTLE,
-                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT, padx=6)
-
-        self._echem_panel = EchemPanel(echem_outer)
-
-        # ── bottom bar ────────────────────────────────────────────────────
-        bottom = tk.Frame(r, bg=T.BG_SLICE_BAR)
-        bottom.pack(fill=tk.X, side=tk.BOTTOM)
-
-        sr = tk.Frame(bottom, bg=T.BG_SLICE_BAR, pady=3)
-        sr.pack(fill=tk.X)
-        tk.Label(sr, text=" Slices: ",
-                 bg=T.BG_SLICE_BAR, fg=T.FG_SUBTLE,
-                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT)
-        self._slice_list_frame = tk.Frame(sr, bg=T.BG_SLICE_BAR)
-        self._slice_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        _RRB = "#fefce8"
-        rr = tk.Frame(bottom, bg=_RRB, pady=3)
-        rr.pack(fill=tk.X)
-        tk.Label(rr, text=" Regions:",
-                 bg=_RRB, fg=T.FG_SUBTLE,
-                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT)
-        self._region_list_frame = tk.Frame(rr, bg=_RRB)
-        self._region_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._REGION_ROW_BG = _RRB
 
         r.bind("<Left>",   lambda e: self._nudge_focused(-1))
         r.bind("<Right>",  lambda e: self._nudge_focused(+1))
@@ -855,6 +892,7 @@ class AnalysisWindow:
             traceback.print_exc()
             return
         self.wavenumbers, self.times, self.intensity = wn, t, Z
+        self.max_intensity = float(np.amax(self.intensity))
         self._refresh_heatmap()
         self._add_vertical_slice()
         self._add_horizontal_slice()
@@ -934,6 +972,9 @@ class AnalysisWindow:
     # ─────────────────────────────────────────────────────────────────────
 
     def _refresh_heatmap(self):
+        """Full redraw of the heatmap (expensive).
+        Called only when data/cmap changes, never during drag.
+        Invalidates the blit background cache."""
         if self.intensity.size == 0:
             return
         if self._cbar is not None:
@@ -949,6 +990,7 @@ class AnalysisWindow:
             origin="lower" if w1 > w0 else "upper",
             extent=[t0, t1, w0, w1],
             cmap=self._cmap, interpolation="none",
+            vmax=self.max_intensity * 0.5  # TODO: make factor user accessible
         )
         self._cbar = self._fig_heat.colorbar(self._heatmap_img, ax=ax, location="right")
         for s in self.slices:
@@ -957,22 +999,30 @@ class AnalysisWindow:
         for rg in self.regions:
             rg.rect_obj = None
             self._draw_region_rect(rg)
-        self._canvas_heat.draw_idle()
+
+        # Invalidate blit cache — recaptured on next drag start
+        self._heat_bg = None
+        # Use draw() not draw_idle() here so the canvas is fully rendered
+        # before any subsequent copy_from_bbox call.
+        self._canvas_heat.draw()
 
     def _draw_slice_line(self, s: Slice):
+        """Create or update the Line2D for a slice on the heatmap axes."""
         focused = s is self._focused_slice
         lw = 2.2 if focused else 1.4
         ls = "-"  if focused else "--"
         if s.kind == "vertical":
             val = self.times[s.index]
             if s.line_obj is None:
-                s.line_obj = self._ax_heat.axvline(val, color=s.color, lw=lw, ls=ls)
+                s.line_obj = self._ax_heat.axvline(val, color=s.color, lw=lw,
+                                                   ls=ls, animated=False)
             else:
                 s.line_obj.set_xdata([val, val])
         else:
             val = self.wavenumbers[s.index]
             if s.line_obj is None:
-                s.line_obj = self._ax_heat.axhline(val, color=s.color, lw=lw, ls=ls)
+                s.line_obj = self._ax_heat.axhline(val, color=s.color, lw=lw,
+                                                   ls=ls, animated=False)
             else:
                 s.line_obj.set_ydata([val, val])
         s.line_obj.set_color(s.color); s.line_obj.set_linewidth(lw)
@@ -990,7 +1040,7 @@ class AnalysisWindow:
                 (t_lo, w_lo), t_hi - t_lo, w_hi - w_lo,
                 linewidth=lw, edgecolor=rg.color,
                 facecolor=rg.color, alpha=alpha_fill,
-                linestyle="-", zorder=3)
+                linestyle="-", zorder=3, animated=False)
             self._ax_heat.add_patch(rg.rect_obj)
         else:
             rg.rect_obj.set_xy((t_lo, w_lo))
@@ -1003,10 +1053,79 @@ class AnalysisWindow:
         rg.rect_obj.set_visible(rg.visible)
 
     # ─────────────────────────────────────────────────────────────────────
+    # Blit-based drag helpers
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _blit_drag_start(self, s: Slice):
+        """
+        Begin blit session for slice s.
+
+        Strategy:
+          1. Mark the dragged line as animated=True (excluded from normal
+             draw cycle so it won't appear in the captured background).
+          2. Do a full canvas.draw() so all *other* artists are rendered.
+          3. Capture the result via copy_from_bbox — this is our static bg.
+          4. Immediately restore and re-draw the line so the user sees it.
+        """
+        line = s.line_obj
+        if line is None:
+            return
+        line.set_animated(True)
+        self._fig_heat.canvas.draw()
+        self._heat_bg      = self._fig_heat.canvas.copy_from_bbox(self._ax_heat.bbox)
+        self._blit_artists = [line]
+        # Paint the line back immediately so there's no flash
+        self._fig_heat.canvas.restore_region(self._heat_bg)
+        self._ax_heat.draw_artist(line)
+        self._fig_heat.canvas.blit(self._ax_heat.bbox)
+
+    def _blit_drag_move(self, s: Slice):
+        """
+        Fast per-motion update: restore bg bitmap, re-draw only the
+        moving line, push just the axes bbox to the screen.
+        No Python-side rasterisation of the heatmap image occurs.
+        """
+        if self._heat_bg is None or not self._blit_artists:
+            self._canvas_heat.draw_idle()   # graceful fallback
+            return
+        canvas = self._fig_heat.canvas
+        canvas.restore_region(self._heat_bg)
+        for artist in self._blit_artists:
+            self._ax_heat.draw_artist(artist)
+        canvas.blit(self._ax_heat.bbox)
+
+    def _blit_drag_end(self, s: Slice):
+        """
+        End blit session: restore line to non-animated, do a proper
+        full draw so the final position is permanently composited into
+        the canvas (and the background cache is valid again).
+        """
+        line = s.line_obj
+        if line is not None:
+            line.set_animated(False)
+        self._heat_bg      = None
+        self._blit_artists = []
+        self._canvas_heat.draw_idle()
+
+    # ─────────────────────────────────────────────────────────────────────
     # PlotPanel update helpers
     # ─────────────────────────────────────────────────────────────────────
 
-    def _upsert_slice_in_panel(self, s: Slice):
+    def _upsert_slice_in_panel(self, s: Slice, *, throttled: bool = False):
+        """
+        Push updated slice data to the spectrum / time side panel.
+
+        throttled=True  →  skip the redraw if fewer than
+        SIDE_PANEL_THROTTLE_MS ms have elapsed since the last update.
+        This prevents a build-up of queued redraws during fast drags
+        while still giving the user a live preview at ~25 fps.
+        """
+        if throttled:
+            now = time.monotonic()
+            if (now - self._last_side_redraw_t) * 1000 < SIDE_PANEL_THROTTLE_MS:
+                return
+            self._last_side_redraw_t = now
+
         if not s.visible or self.intensity.size == 0:
             panel = self._spec_panel if s.kind == "vertical" else self._time_panel
             if s.uid in panel._lines:
@@ -1014,6 +1133,7 @@ class AnalysisWindow:
                 panel.redraw()
             self._sync_echem_markers()
             return
+
         if s.kind == "vertical":
             self._spec_panel.upsert(
                 s.uid, self.wavenumbers, self.intensity[:, s.index],
@@ -1224,7 +1344,11 @@ class AnalysisWindow:
             return
         s = self._nearest_slice(event)
         if s is not None:
-            self._drag_slice = s; self._set_focused_slice(s); return
+            self._drag_slice = s
+            self._set_focused_slice(s)
+            # Start blit session — captures heatmap bg without the moving line
+            self._blit_drag_start(s)
+            return
         for rg in self.regions:
             t_lo = self.times[rg.ti0];  t_hi = self.times[rg.ti1]
             w_lo = self.wavenumbers[min(rg.wi0, rg.wi1)]
@@ -1263,9 +1387,17 @@ class AnalysisWindow:
                                   0, len(self.wavenumbers) - 1))
             if idx != s.index:
                 s.index = idx
-                self._draw_slice_line(s)
-                self._canvas_heat.draw_idle()
-                self._upsert_slice_in_panel(s)
+                # Move the artist's position directly — no redraw of heatmap
+                if s.kind == "vertical":
+                    s.line_obj.set_xdata([self.times[idx], self.times[idx]])
+                else:
+                    s.line_obj.set_ydata([self.wavenumbers[idx], self.wavenumbers[idx]])
+
+                # Fast blit update on the heatmap canvas
+                self._blit_drag_move(s)
+
+                # Throttled side-panel update (~25 fps during drag)
+                self._upsert_slice_in_panel(s, throttled=True)
                 self._update_slice_widgets(s)
 
     def _on_heat_release(self, event):
@@ -1281,7 +1413,14 @@ class AnalysisWindow:
             self._region_btn_text.set("[ ] Draw region")
             self._canvas_heat.get_tk_widget().configure(cursor="")
             return
-        self._drag_slice = None
+
+        if self._drag_slice is not None:
+            s = self._drag_slice
+            self._drag_slice = None
+            # End blit mode → full redraw at final position + full panel sync
+            self._blit_drag_end(s)
+            self._upsert_slice_in_panel(s, throttled=False)
+            self._sync_echem_markers()
 
     def _on_heat_scroll(self, event):
         self._nudge_focused(1 if event.button == "up" else -1)
