@@ -23,6 +23,10 @@ FG_AXIS_LABEL   = "#4a5568"   # matplotlib axis label color
 FG_TICK         = "#6b7280"   # matplotlib tick label color
 FG_PLOT_TITLE   = "#2d3748"   # matplotlib axes title color
 
+# ── Plot lines ────────────────────────────────────────────────────────────────
+LINE_WIDTH      = 1.0
+LINE_STYLE      = "-"
+
 # ── Borders / spines / grid ───────────────────────────────────────────────────
 COLOR_SPINE     = "#cbd5e0"   # matplotlib spine edge color
 COLOR_GRID      = "#e2e8f0"   # matplotlib grid line color (if enabled)
@@ -45,7 +49,7 @@ FG_STATUS       = "#6b7280"
 # ── Sash (pane dividers) ──────────────────────────────────────────────────────
 COLOR_SASH      = "#c8d0dc"
 
-# ── Slice colors (cycling palette for selectors) ──────────────────────────────
+# ── Slice colors (cycling palette for selectors and regions) ──────────────────────────────
 SLICE_COLORS = [
     "#1a73e8",  # blue
     "#e53935",  # red

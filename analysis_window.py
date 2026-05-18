@@ -510,7 +510,7 @@ class EchemPanel:
         self.uv_panel.upsert(_ECHEM_LINE_UID,
                              data.time, data.uv,
                              label=data.uv_label,
-                             color=uv_color, lw=1.4, ls="-")
+                             color=uv_color, lw=T.LINE_WIDTH, ls=T.LINE_STYLE)
         self.uv_panel.set_labels("Time (s)", data.uv_label,
                                  f"{data.sheet_name}  –  {data.uv_label}")
         self.uv_panel.redraw()
@@ -518,7 +518,7 @@ class EchemPanel:
         self.pot_panel.upsert(_ECHEM_LINE_UID,
                               data.time, data.potential,
                               label=data.potential_label,
-                              color=pot_color, lw=1.4, ls="-")
+                              color=pot_color, lw=T.LINE_WIDTH, ls=T.LINE_STYLE)
         self.pot_panel.set_labels("Time (s)", data.potential_label,
                                   f"{data.sheet_name}  –  {data.potential_label}")
         self.pot_panel.redraw()
@@ -599,7 +599,7 @@ class RegionPlotWindow:
         t_lo, t_hi = t[rg.ti0], t[rg.ti1]
         self._spec_panel.upsert(0, wn[rg.wi0:rg.wi1 + 1], mean_spec,
                                 label=f"t:[{t_lo:.3g},{t_hi:.3g}]",
-                                color=rg.color, lw=2.0, ls="-.")
+                                color=rg.color, lw=T.LINE_WIDTH, ls=T.LINE_STYLE)
         self._spec_panel.set_labels("Wavenumber (cm⁻¹)", "Intensity",
                                     f"[{rg.label}] Mean spectrum  t:[{t_lo:.3g},{t_hi:.3g}]")
         self._spec_panel.redraw()
@@ -608,7 +608,7 @@ class RegionPlotWindow:
         w_lo = wn[min(rg.wi0, rg.wi1)];  w_hi = wn[max(rg.wi0, rg.wi1)]
         self._time_panel.upsert(0, t[rg.ti0:rg.ti1 + 1], mean_trace,
                                 label=f"wn:[{w_lo:.1f},{w_hi:.1f}]",
-                                color=rg.color, lw=2.0, ls="-.")
+                                color=rg.color, lw=T.LINE_WIDTH, ls=T.LINE_STYLE)
         self._time_panel.set_labels("Time (s)", "Intensity",
                                     f"[{rg.label}] Mean time trace  wn:[{w_lo:.1f},{w_hi:.1f}]")
         self._time_panel.redraw()
@@ -988,7 +988,7 @@ class AnalysisWindow:
         self._heatmap_img = ax.imshow(
             self.intensity, aspect="auto",
             origin="lower" if w1 > w0 else "upper",
-            extent=[t0, t1, w0, w1],
+            extent=(t0, t1, w0, w1),
             cmap=self._cmap, interpolation="none",
             vmax=self.max_intensity * 0.5  # TODO: make factor user accessible
         )
@@ -1138,13 +1138,13 @@ class AnalysisWindow:
             self._spec_panel.upsert(
                 s.uid, self.wavenumbers, self.intensity[:, s.index],
                 label=f"{s.label}  t={self.times[s.index]:.3g}",
-                color=s.color, lw=1.4, ls="-")
+                color=s.color, lw=T.LINE_WIDTH, ls=T.LINE_STYLE)
             self._spec_panel.redraw()
         else:
             self._time_panel.upsert(
                 s.uid, self.times, self.intensity[s.index, :],
                 label=f"{s.label}  wn={self.wavenumbers[s.index]:.1f}",
-                color=s.color, lw=1.4, ls="-")
+                color=s.color, lw=T.LINE_WIDTH, ls=T.LINE_STYLE)
             self._time_panel.redraw()
         self._sync_echem_markers()
 
