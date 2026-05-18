@@ -1,41 +1,39 @@
 """
-Raman Data Viewer – Analysis Window  (refactored)
-==================================================
-Key architectural changes vs. the original
--------------------------------------------
-1.  **PlotPanel** – owns one matplotlib Figure/Axes pair embedded in a given
-    Tk parent frame.  It maintains a dict of ``Line2D`` objects keyed by a
-    stable UID so that updates call ``line.set_data()`` + ``relim /
-    autoscale_view`` instead of ``ax.cla()`` followed by a full redraw.
-    The only time the axes are cleared is when an item is *removed*.
-
-2.  **RegionPlotWindow** – a ``tk.Toplevel`` that holds two ``PlotPanel``s
-    (spectrum + time trace) for a *single* region.  Each region gets its own
-    floating window opened on demand via "Open detail…" in the region bar.
-
-3.  ``AnalysisWindow`` delegates every plot mutation to the ``PlotPanel``
-    instances; it no longer touches matplotlib artists directly.
-
-CSV format
-----------
-  • Row 0 (header): first cell ignored, remaining cells = time values
-  • Rows 1-N:  first cell = wavenumber,  remaining cells = intensity values
-
+Raman Data Viewer – Analysis Window
+=====================================
 Layout (main window)
 --------------------
   ┌─────────────────────────────┬──────────────────────────┐
   │  Heatmap                    │  Spectrum (V-slices)     │
   │  draggable V / H lines      ├──────────────────────────┤
-  │  draggable rect regions     │  Time trace (H-slices)   │
-  └─────────────────────────────┴──────────────────────────┘
-  Bottom toolbar: slice bar / region bar, cmap picker, crosshair info
+  │  draggable rect regions     │  Time traces (H-slices)  │
+  ├─────────────────────────────┴──────────────────────────┤
+  │  Echem panel  ── UV/VIS intensity vs time              │
+  │               ── Potential vs time                     │
+  │  Vertical slice / region boundaries mirrored as        │
+  │  dashed marker lines on the echem time axis.           │
+  └────────────────────────────────────────────────────────┘
+  Bottom: slice bar / region bar
 
-  Region windows (one per region, opened on demand)
-  ┌────────────────────────────────────────────────┐
-  │  Mean spectrum  (averaged over region t-range) │
-  ├────────────────────────────────────────────────┤
-  │  Mean time trace (averaged over region wn-range│
-  └────────────────────────────────────────────────┘
+Key classes
+-----------
+PlotPanel
+    Owns one Figure/Axes in a Tk frame.  Maintains uid→Line2D so that
+    updates call set_data()+relim instead of cla().  Also manages a
+    separate uid→axvline dict for time-marker synchronisation.
+
+EchemData
+    Parsed contents of one xlsx sheet: time, potential, uv arrays.
+
+EchemPanel
+    Two stacked PlotPanels (UV-vis + potential) with sync_markers().
+
+RegionPlotWindow
+    Floating Toplevel with averaged spectrum + time trace per Region.
+
+xlsx sheet auto-selection
+    Best sheet is chosen by SequenceMatcher ratio against the Raman
+    CSV filename stem; user can override via Combobox.
 """
 
 from __future__ import annotations
@@ -45,8 +43,10 @@ import sys
 import csv
 import traceback
 import tkinter as tk
-from tkinter import ttk, messagebox, colorchooser
+from tkinter import ttk, messagebox, colorchooser, filedialog
 from typing import Optional
+from difflib import SequenceMatcher
+from dataclasses import dataclass
 
 import numpy as np
 import matplotlib
@@ -82,8 +82,12 @@ def _style_axes(ax, xlabel: str, ylabel: str, title: str,
     ax.grid(True, color=T.COLOR_GRID, linewidth=0.5, linestyle="--", alpha=0.7)
 
 
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CSV loader
+# CSV loader (Raman)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _filter_positive_times(times: np.ndarray,
@@ -133,17 +137,167 @@ def load_raman_csv(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# xlsx loader (Echem)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class EchemData:
+    """Parsed electrochemistry data from one xlsx sheet."""
+    sheet_name:      str
+    time:            np.ndarray   # [M]  seconds
+    potential:       np.ndarray   # [M]  V
+    uv:              np.ndarray   # [M]  UV/VIS
+    potential_label: str = "Potential [V]"
+    uv_label:        str = "UV/VIS"
+
+
+def _to_float_array(values: list) -> np.ndarray:
+    out = []
+    for v in values:
+        if v is None or v == "":
+            out.append(np.nan)
+            continue
+        try:
+            out.append(float(str(v).replace(",", ".")))
+        except (ValueError, TypeError):
+            out.append(np.nan)
+    return np.array(out, dtype=float)
+
+
+def load_echem_xlsx(path: str) -> dict[str, EchemData]:
+    """
+    Load all sheets from *path*.  Returns sheet_name → EchemData.
+
+    Column detection
+    ----------------
+    Sheets contain interleaved groups of (Time, <data>) column pairs.
+    We locate:
+      • potential column – header containing "DAQ" + "poten", or just "poten"
+      • UV column        – header containing "UV"
+
+    The Time column that immediately precedes each data column is used as
+    its time axis.  If the two time axes differ the UV trace is interpolated
+    onto the potential time axis.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        raise ImportError(
+            "openpyxl is required to load xlsx files.\n"
+            "Install it with:  pip install openpyxl"
+        )
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    result: dict[str, EchemData] = {}
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        all_rows: list[tuple] = list(ws.iter_rows(values_only=True))
+        if len(all_rows) < 2:
+            continue
+
+        # find first row with at least one non-empty string → header
+        header_idx = 0
+        for i, row in enumerate(all_rows):
+            if any(isinstance(c, str) and c.strip() for c in row):
+                header_idx = i
+                break
+
+        header    = [str(c).strip() if c is not None else "" for c in all_rows[header_idx]]
+        data_rows = all_rows[header_idx + 1:]
+        if not data_rows:
+            continue
+
+        # helper: find first column whose header contains ALL keywords
+        def _find_col(keywords: list[str],
+                      exclude: list[str] | None = None) -> int | None:
+            kw = [k.lower() for k in keywords]
+            ex = [e.lower() for e in (exclude or [])]
+            for ci, h in enumerate(header):
+                hl = h.lower()
+                if all(k in hl for k in kw) and not any(e in hl for e in ex):
+                    return ci
+            return None
+
+        time_cols = [i for i, h in enumerate(header) if h.lower() == "time"]
+
+        def _time_for(data_col: int | None) -> int | None:
+            if data_col is None:
+                return None
+            candidates = [t for t in time_cols if t <= data_col]
+            return max(candidates) if candidates else (time_cols[0] if time_cols else None)
+
+        pot_col = _find_col(["daq", "poten"]) or _find_col(["poten"])
+        uv_col  = _find_col(["uv"])
+
+        t_pot_col = _time_for(pot_col)
+        t_uv_col  = _time_for(uv_col)
+
+        def _col(idx: int | None) -> list:
+            if idx is None:
+                return []
+            return [row[idx] if idx < len(row) else None for row in data_rows]
+
+        t_pot_vals = _col(t_pot_col)
+        pot_vals   = _col(pot_col)
+        t_uv_vals  = _col(t_uv_col)
+        uv_vals    = _col(uv_col)
+
+        t_arr   = _to_float_array(t_pot_vals if t_pot_vals else t_uv_vals)
+        pot_arr = _to_float_array(pot_vals)
+        uv_arr  = _to_float_array(uv_vals)
+
+        # interpolate UV onto potential time axis if they differ
+        if t_uv_vals and t_pot_vals and t_uv_col != t_pot_col:
+            t_uv_arr = _to_float_array(t_uv_vals)
+            valid    = np.isfinite(t_uv_arr) & np.isfinite(uv_arr)
+            if valid.sum() > 1:
+                uv_arr = np.interp(t_arr, t_uv_arr[valid], uv_arr[valid],
+                                   left=np.nan, right=np.nan)
+
+        # strip NaN-time rows
+        valid   = np.isfinite(t_arr)
+        t_arr   = t_arr[valid]
+        n       = len(t_arr)
+        pot_arr = pot_arr[valid] if len(pot_arr) == len(valid) else np.full(n, np.nan)
+        uv_arr  = uv_arr[valid]  if len(uv_arr)  == len(valid) else np.full(n, np.nan)
+
+        if t_arr.size == 0:
+            continue
+
+        result[sheet_name] = EchemData(
+            sheet_name      = sheet_name,
+            time            = t_arr,
+            potential       = pot_arr,
+            uv              = uv_arr,
+            potential_label = header[pot_col] if pot_col is not None else "Potential [V]",
+            uv_label        = header[uv_col]  if uv_col  is not None else "UV/VIS",
+        )
+
+    wb.close()
+    return result
+
+
+def best_sheet_match(sheet_names: list[str], csv_filename: str) -> str:
+    """Return the sheet name most similar to the CSV filename stem."""
+    stem   = os.path.splitext(csv_filename)[0]
+    scored = sorted(sheet_names,
+                    key=lambda s: _similarity(s, stem),
+                    reverse=True)
+    return scored[0] if scored else sheet_names[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Data descriptors
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Slice:
-    """One draggable selector line on the heatmap."""
     _id_counter = 0
 
     def __init__(self, kind: str, index: int, color: str, label: str = ""):
         Slice._id_counter += 1
-        self.uid = Slice._id_counter
-        self.kind = kind          # "vertical" | "horizontal"
+        self.uid   = Slice._id_counter
+        self.kind  = kind          # "vertical" | "horizontal"
         self.index = index
         self.color = color
         self.label = label or f"{'W' if kind == 'vertical' else 'T'}{self.uid}"
@@ -152,12 +306,6 @@ class Slice:
 
 
 class Region:
-    """
-    Rectangular selection on the heatmap (index ranges).
-
-    ti0, ti1  – time-axis indices      (ti0 <= ti1)
-    wi0, wi1  – wavenumber indices     (wi0 <= wi1)
-    """
     _id_counter = 0
 
     def __init__(self, ti0: int, ti1: int, wi0: int, wi1: int,
@@ -168,8 +316,8 @@ class Region:
         self.wi0, self.wi1 = wi0, wi1
         self.color = color
         self.label = label or f"R{self.uid}"
-        self.rect_obj: Optional[Rectangle] = None
-        self.visible = True
+        self.rect_obj:     Optional[Rectangle]        = None
+        self.visible       = True
         self.detail_window: Optional[RegionPlotWindow] = None
 
 
@@ -179,101 +327,103 @@ class Region:
 
 class PlotPanel:
     """
-    Embeds one matplotlib Figure/Axes in *parent_frame* and maintains a
-    mapping  uid → Line2D  so that data updates are incremental.
+    One Figure/Axes embedded in a Tk frame.
 
-    Public API
-    ----------
-    upsert(uid, xdata, ydata, **line_kwargs)
-        Create or update the line identified by *uid*.
-    remove(uid)
-        Remove the line and trigger a full axes redraw (necessary only on
-        delete, which is infrequent).
-    clear()
-        Remove every managed line.
-    redraw()
-        Flush pending draw_idle calls.
-    set_labels(xlabel, ylabel, title)
-        Update axes labels without clearing lines.
+    uid → Line2D cache for data lines (incremental set_data updates).
+    Separate uid → Line2D cache for vertical marker lines (axvline).
     """
 
     def __init__(self, parent_frame: tk.Widget,
                  xlabel: str, ylabel: str, title: str,
                  figsize: tuple[float, float] = (4, 3)):
-        self._xlabel = xlabel
-        self._ylabel = ylabel
-        self._title = title
-
         self.fig, self.ax = plt.subplots(figsize=figsize, facecolor=T.BG_FIGURE)
         _style_axes(self.ax, xlabel, ylabel, title)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # uid → Line2D
-        self._lines: dict[int, Line2D] = {}
-        # track whether the legend needs refreshing
-        self._legend_labels: dict[int, str] = {}
+        self._lines:         dict[int, Line2D] = {}
+        self._markers:       dict[int, Line2D] = {}
+        self._legend_labels: dict[int, str]    = {}
 
-    # ── line management ───────────────────────────────────────────────────
+    # ── data lines ────────────────────────────────────────────────────────
 
     def upsert(self, uid: int,
                xdata: np.ndarray, ydata: np.ndarray,
-               label: str = "",
-               color: str = "#888888",
-               lw: float = 1.4,
-               ls: str = "-",
+               label: str = "", color: str = "#888",
+               lw: float = 1.4, ls: str = "-",
                visible: bool = True) -> Line2D:
-        """Create or update the line for *uid*; returns the Line2D."""
         if uid in self._lines:
             line = self._lines[uid]
             line.set_data(xdata, ydata)
-            line.set_color(color)
-            line.set_linewidth(lw)
-            line.set_linestyle(ls)
-            line.set_visible(visible)
+            line.set_color(color); line.set_linewidth(lw)
+            line.set_linestyle(ls); line.set_visible(visible)
             if label:
                 line.set_label(label)
         else:
-            (line,) = self.ax.plot(xdata, ydata,
-                                   color=color, lw=lw, ls=ls,
-                                   label=label, visible=visible)
+            (line,) = self.ax.plot(xdata, ydata, color=color, lw=lw,
+                                   ls=ls, label=label, visible=visible)
             self._lines[uid] = line
-
         self._legend_labels[uid] = label
         self._rescale()
         return line
 
     def remove(self, uid: int):
-        """Remove a line by uid and do a full redraw (infrequent)."""
-        line = self._lines.pop(uid, None)
+        for store in (self._lines, self._markers):
+            ln = store.pop(uid, None)
+            if ln is not None:
+                try:
+                    ln.remove()
+                except Exception:
+                    pass
         self._legend_labels.pop(uid, None)
-        if line is not None:
-            try:
-                line.remove()
-            except Exception:
-                pass
         self._rebuild_legend()
         self._rescale()
         self.canvas.draw_idle()
 
     def clear(self):
-        """Remove all managed lines."""
         for uid in list(self._lines):
             self.remove(uid)
 
     def redraw(self):
-        """Flush any pending draw."""
         self._rebuild_legend()
         self.canvas.draw_idle()
 
     def set_labels(self, xlabel: str, ylabel: str, title: str):
-        self._xlabel = xlabel
         _style_axes(self.ax, xlabel, ylabel, title)
 
     def bind_motion(self, callback):
-        """Convenience: connect a motion_notify_event."""
         self.fig.canvas.mpl_connect("motion_notify_event", callback)
+
+    # ── vertical marker lines ─────────────────────────────────────────────
+
+    def upsert_marker(self, uid: int, xval: float,
+                      color: str = "#888", lw: float = 1.2,
+                      ls: str = "--", alpha: float = 0.75,
+                      visible: bool = True):
+        if uid in self._markers:
+            m = self._markers[uid]
+            m.set_xdata([xval, xval])
+            m.set_color(color); m.set_linewidth(lw)
+            m.set_linestyle(ls); m.set_alpha(alpha)
+            m.set_visible(visible)
+        else:
+            m = self.ax.axvline(xval, color=color, lw=lw, ls=ls,
+                                alpha=alpha, visible=visible)
+            self._markers[uid] = m
+
+    def remove_marker(self, uid: int):
+        m = self._markers.pop(uid, None)
+        if m is not None:
+            try:
+                m.remove()
+            except Exception:
+                pass
+        self.canvas.draw_idle()
+
+    def clear_markers(self):
+        for uid in list(self._markers):
+            self.remove_marker(uid)
 
     # ── internal ──────────────────────────────────────────────────────────
 
@@ -282,20 +432,107 @@ class PlotPanel:
         self.ax.autoscale_view()
 
     def _rebuild_legend(self):
-        visible_lines = [l for l in self._lines.values()
-                         if l.get_visible() and l.get_label()]
-        if visible_lines:
-            self.ax.legend(
-                handles=visible_lines,
-                fontsize=T.FONT_SIZE_SMALL,
-                facecolor=T.BG_PANEL,
-                labelcolor=T.FG_LABEL,
-                edgecolor=T.COLOR_SPINE,
-            )
+        visible = [l for l in self._lines.values()
+                   if l.get_visible() and l.get_label()]
+        if visible:
+            self.ax.legend(handles=visible,
+                           fontsize=T.FONT_SIZE_SMALL,
+                           facecolor=T.BG_PANEL,
+                           labelcolor=T.FG_LABEL,
+                           edgecolor=T.COLOR_SPINE)
         else:
-            legend = self.ax.get_legend()
-            if legend:
-                legend.remove()
+            leg = self.ax.get_legend()
+            if leg:
+                leg.remove()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EchemPanel  –  UV + potential plots below the heatmap
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ECHEM_LINE_UID = -1   # stable uid for the single echem data line
+
+
+class EchemPanel:
+    """
+    Two vertically-stacked PlotPanels (UV-vis intensity, potential).
+
+    load(data)  – replace displayed data.
+    sync_markers(slices, regions, raman_times)  – mirror time positions.
+    """
+
+    def __init__(self, parent_frame: tk.Widget):
+        paned = tk.PanedWindow(parent_frame, orient=tk.VERTICAL,
+                               bg=T.COLOR_SASH, sashwidth=4)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        uv_frame = tk.Frame(paned, bg=T.BG_APP)
+        paned.add(uv_frame, minsize=100)
+        self.uv_panel = PlotPanel(uv_frame,
+                                  xlabel="Time (s)", ylabel="UV/VIS",
+                                  title="UV/VIS intensity vs time",
+                                  figsize=(6, 2))
+
+        pot_frame = tk.Frame(paned, bg=T.BG_APP)
+        paned.add(pot_frame, minsize=100)
+        self.pot_panel = PlotPanel(pot_frame,
+                                   xlabel="Time (s)", ylabel="Potential [V]",
+                                   title="Potential vs time",
+                                   figsize=(6, 2))
+
+    # ── public ────────────────────────────────────────────────────────────
+
+    def load(self, data: EchemData):
+        uv_color  = T.SLICE_COLORS[2] if len(T.SLICE_COLORS) > 2 else "#7c3aed"
+        pot_color = T.SLICE_COLORS[3] if len(T.SLICE_COLORS) > 3 else "#b45309"
+
+        self.uv_panel.upsert(_ECHEM_LINE_UID,
+                             data.time, data.uv,
+                             label=data.uv_label,
+                             color=uv_color, lw=1.4, ls="-")
+        self.uv_panel.set_labels("Time (s)", data.uv_label,
+                                 f"{data.sheet_name}  –  {data.uv_label}")
+        self.uv_panel.redraw()
+
+        self.pot_panel.upsert(_ECHEM_LINE_UID,
+                              data.time, data.potential,
+                              label=data.potential_label,
+                              color=pot_color, lw=1.4, ls="-")
+        self.pot_panel.set_labels("Time (s)", data.potential_label,
+                                  f"{data.sheet_name}  –  {data.potential_label}")
+        self.pot_panel.redraw()
+
+    def sync_markers(self, slices: list[Slice],
+                     regions: list[Region],
+                     raman_times: np.ndarray):
+        """Mirror Raman slice/region time positions as axvline markers."""
+        for panel in (self.uv_panel, self.pot_panel):
+            panel.clear_markers()
+
+        if raman_times.size == 0:
+            return
+
+        for s in slices:
+            if s.kind != "vertical" or not s.visible:
+                continue
+            t_val = raman_times[s.index]
+            for panel in (self.uv_panel, self.pot_panel):
+                panel.upsert_marker(s.uid, t_val,
+                                    color=s.color, lw=1.2, ls="--", alpha=0.75)
+                panel.canvas.draw_idle()
+
+        for rg in regions:
+            if not rg.visible:
+                continue
+            for marker_uid, t_idx, ls in [
+                (rg.uid * 10000,     rg.ti0, "-."),
+                (rg.uid * 10000 + 1, rg.ti1, "-."),
+            ]:
+                t_val = raman_times[t_idx]
+                for panel in (self.uv_panel, self.pot_panel):
+                    panel.upsert_marker(marker_uid, t_val,
+                                        color=rg.color, lw=1.4, ls=ls, alpha=0.65)
+                    panel.canvas.draw_idle()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,19 +540,11 @@ class PlotPanel:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RegionPlotWindow:
-    """
-    A floating ``tk.Toplevel`` that shows the averaged spectrum and averaged
-    time trace for one :class:`Region`.  Refreshes incrementally via its own
-    two :class:`PlotPanel` instances.
-    """
-
     def __init__(self, parent: tk.Tk, region: Region,
                  wavenumbers: np.ndarray, times: np.ndarray,
                  intensity: np.ndarray):
         self._region = region
-        self._wn = wavenumbers
-        self._t = times
-        self._Z = intensity
+        self._wn, self._t, self._Z = wavenumbers, times, intensity
 
         top = tk.Toplevel(parent)
         top.title(f"Region {region.label} – detail")
@@ -328,75 +557,46 @@ class RegionPlotWindow:
                                bg=T.COLOR_SASH, sashwidth=5)
         paned.pack(fill=tk.BOTH, expand=True)
 
-        spec_frame = tk.Frame(paned, bg=T.BG_APP)
-        paned.add(spec_frame, minsize=200)
-        self._spec_panel = PlotPanel(
-            spec_frame,
-            xlabel="Wavenumber (cm⁻¹)", ylabel="Intensity",
-            title=f"[{region.label}] Mean spectrum",
-        )
+        spec_f = tk.Frame(paned, bg=T.BG_APP)
+        paned.add(spec_f, minsize=200)
+        self._spec_panel = PlotPanel(spec_f,
+                                     xlabel="Wavenumber (cm⁻¹)", ylabel="Intensity",
+                                     title=f"[{region.label}] Mean spectrum")
 
-        time_frame = tk.Frame(paned, bg=T.BG_APP)
-        paned.add(time_frame, minsize=200)
-        self._time_panel = PlotPanel(
-            time_frame,
-            xlabel="Time (s)", ylabel="Intensity",
-            title=f"[{region.label}] Mean time trace",
-        )
-
+        time_f = tk.Frame(paned, bg=T.BG_APP)
+        paned.add(time_f, minsize=200)
+        self._time_panel = PlotPanel(time_f,
+                                     xlabel="Time (s)", ylabel="Intensity",
+                                     title=f"[{region.label}] Mean time trace")
         self.refresh()
 
-    # ── public ────────────────────────────────────────────────────────────
-
     def refresh(self):
-        """Recompute averaged data for the current region bounds and update plots."""
-        rg = self._region
-        wn = self._wn
-        t = self._t
-        Z = self._Z
+        rg, wn, t, Z = self._region, self._wn, self._t, self._Z
         if Z.size == 0:
             return
-
-        # averaged spectrum  (mean over time axis of the region)
-        mean_spec = np.nanmean(Z[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=1)
+        mean_spec  = np.nanmean(Z[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=1)
         t_lo, t_hi = t[rg.ti0], t[rg.ti1]
-        self._spec_panel.upsert(
-            uid=0,
-            xdata=wn[rg.wi0:rg.wi1 + 1],
-            ydata=mean_spec,
-            label=f"t:[{t_lo:.3g},{t_hi:.3g}]",
-            color=rg.color, lw=2.0, ls="-.",
-        )
-        self._spec_panel.set_labels(
-            "Wavenumber (cm⁻¹)", "Intensity",
-            f"[{rg.label}] Mean spectrum  t:[{t_lo:.3g},{t_hi:.3g}]",
-        )
+        self._spec_panel.upsert(0, wn[rg.wi0:rg.wi1 + 1], mean_spec,
+                                label=f"t:[{t_lo:.3g},{t_hi:.3g}]",
+                                color=rg.color, lw=2.0, ls="-.")
+        self._spec_panel.set_labels("Wavenumber (cm⁻¹)", "Intensity",
+                                    f"[{rg.label}] Mean spectrum  t:[{t_lo:.3g},{t_hi:.3g}]")
         self._spec_panel.redraw()
 
-        # averaged time trace (mean over wavenumber axis of the region)
         mean_trace = np.nanmean(Z[rg.wi0:rg.wi1 + 1, rg.ti0:rg.ti1 + 1], axis=0)
-        w_lo = wn[min(rg.wi0, rg.wi1)]
-        w_hi = wn[max(rg.wi0, rg.wi1)]
-        self._time_panel.upsert(
-            uid=0,
-            xdata=t[rg.ti0:rg.ti1 + 1],
-            ydata=mean_trace,
-            label=f"wn:[{w_lo:.1f},{w_hi:.1f}]",
-            color=rg.color, lw=2.0, ls="-.",
-        )
-        self._time_panel.set_labels(
-            "Time (s)", "Intensity",
-            f"[{rg.label}] Mean time trace  wn:[{w_lo:.1f},{w_hi:.1f}]",
-        )
+        w_lo = wn[min(rg.wi0, rg.wi1)];  w_hi = wn[max(rg.wi0, rg.wi1)]
+        self._time_panel.upsert(0, t[rg.ti0:rg.ti1 + 1], mean_trace,
+                                label=f"wn:[{w_lo:.1f},{w_hi:.1f}]",
+                                color=rg.color, lw=2.0, ls="-.")
+        self._time_panel.set_labels("Time (s)", "Intensity",
+                                    f"[{rg.label}] Mean time trace  wn:[{w_lo:.1f},{w_hi:.1f}]")
         self._time_panel.redraw()
 
     def update_color(self):
-        """Called when the region color changes."""
-        rg = self._region
         for panel in (self._spec_panel, self._time_panel):
-            line = panel._lines.get(0)
-            if line is not None:
-                line.set_color(rg.color)
+            ln = panel._lines.get(0)
+            if ln:
+                ln.set_color(self._region.color)
                 panel.redraw()
 
     def destroy(self):
@@ -404,8 +604,6 @@ class RegionPlotWindow:
             self._top.destroy()
         except Exception:
             pass
-
-    # ── internal ──────────────────────────────────────────────────────────
 
     def _on_close(self):
         self._region.detail_window = None
@@ -422,34 +620,33 @@ class AnalysisWindow:
     MODE_REGION = "region"
 
     def __init__(self, root: tk.Tk, path: str):
-        self.root = root
-        self.path = path
+        self.root  = root
+        self.path  = path
         self.fname = os.path.basename(path)
 
         self.wavenumbers: np.ndarray = np.array([])
-        self.times: np.ndarray = np.array([])
-        self.intensity: np.ndarray = np.array([])
+        self.times:       np.ndarray = np.array([])
+        self.intensity:   np.ndarray = np.array([])
 
-        # slices
-        self.slices: list[Slice] = []
-        self._drag_slice: Optional[Slice] = None
-        self._focused_slice: Optional[Slice] = None
-        self._slice_widgets: dict[int, dict] = {}
+        self.slices:         list[Slice]        = []
+        self._drag_slice:    Optional[Slice]    = None
+        self._focused_slice: Optional[Slice]    = None
+        self._slice_widgets: dict[int, dict]    = {}
 
-        # regions
-        self.regions: list[Region] = []
-        self._focused_region: Optional[Region] = None
-        self._region_widgets: dict[int, dict] = {}
+        self.regions:          list[Region]       = []
+        self._focused_region:  Optional[Region]   = None
+        self._region_widgets:  dict[int, dict]    = {}
 
-        # draw-region transient state
-        self._mode = self.MODE_SLICE
-        self._draw_start: Optional[tuple[float, float]] = None
-        self._draw_rect_patch: Optional[Rectangle] = None
+        self._mode             = self.MODE_SLICE
+        self._draw_start:      Optional[tuple[float, float]] = None
+        self._draw_rect_patch: Optional[Rectangle]           = None
 
-        # heatmap state
-        self._cmap = T.DEFAULT_CMAP
-        self._cbar = None
+        self._cmap        = T.DEFAULT_CMAP
+        self._cbar        = None
         self._heatmap_img = None
+
+        self._echem_sheets: dict[str, EchemData] = {}
+        self._echem_path:   Optional[str]         = None
 
         self._build_ui()
         self._load_data()
@@ -461,8 +658,8 @@ class AnalysisWindow:
     def _build_ui(self):
         r = self.root
         r.title(f"Raman Analysis – {self.fname}")
-        r.geometry("1280x820")
-        r.minsize(900, 640)
+        r.geometry("1280x980")
+        r.minsize(900, 700)
         r.configure(bg=T.BG_APP)
 
         # ── top toolbar ──────────────────────────────────────────────────
@@ -517,12 +714,52 @@ class AnalysisWindow:
                  bg=T.BG_TOOLBAR, fg=T.FG_SUBTLE,
                  font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.RIGHT, padx=12)
 
-        # ── main paned: heatmap left / plots right ───────────────────────
-        paned = tk.PanedWindow(r, orient=tk.HORIZONTAL,
+        # ── echem toolbar ─────────────────────────────────────────────────
+        echem_bar = tk.Frame(r, bg="#f0fdf4", pady=4)
+        echem_bar.pack(fill=tk.X, side=tk.TOP)
+
+        tk.Label(echem_bar, text="  Echem xlsx:",
+                 bg="#f0fdf4", fg=T.FG_SUBTLE,
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT)
+
+        self._echem_path_var = tk.StringVar(value="(none loaded)")
+        tk.Label(echem_bar, textvariable=self._echem_path_var,
+                 bg="#f0fdf4", fg="#166534",
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT, padx=(4, 12))
+
+        tk.Button(echem_bar, text="Load xlsx…",
+                  bg="#bbf7d0", fg="#14532d",
+                  activebackground="#86efac", activeforeground="#14532d",
+                  command=self._browse_echem, **btn_cfg).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(echem_bar, text="  Sheet:",
+                 bg="#f0fdf4", fg=T.FG_SUBTLE,
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT, padx=(10, 2))
+
+        self._sheet_var   = tk.StringVar(value="")
+        self._sheet_combo = ttk.Combobox(echem_bar, textvariable=self._sheet_var,
+                                         values=[], width=24, state="readonly")
+        self._sheet_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self._sheet_combo.bind("<<ComboboxSelected>>", self._on_sheet_selected)
+
+        self._echem_info_var = tk.StringVar(value="")
+        tk.Label(echem_bar, textvariable=self._echem_info_var,
+                 bg="#f0fdf4", fg=T.FG_SUBTLE,
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT, padx=6)
+
+        # ── outer vertical paned: upper (heatmap+side) / lower (echem) ───
+        outer = tk.PanedWindow(r, orient=tk.VERTICAL,
+                               bg=T.COLOR_SASH, sashwidth=6)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # upper half
+        upper = tk.Frame(outer, bg=T.BG_APP)
+        outer.add(upper, minsize=360)
+
+        paned = tk.PanedWindow(upper, orient=tk.HORIZONTAL,
                                bg=T.COLOR_SASH, sashwidth=6, sashrelief=tk.FLAT)
         paned.pack(fill=tk.BOTH, expand=True)
 
-        # left – heatmap
         left = tk.Frame(paned, bg=T.BG_APP)
         paned.add(left, minsize=400)
 
@@ -532,57 +769,67 @@ class AnalysisWindow:
                     "Raman Intensity Heatmap")
         self._canvas_heat = FigureCanvasTkAgg(self._fig_heat, master=left)
         self._canvas_heat.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
         self._fig_heat.canvas.mpl_connect("button_press_event",   self._on_heat_press)
         self._fig_heat.canvas.mpl_connect("motion_notify_event",  self._on_heat_motion)
         self._fig_heat.canvas.mpl_connect("button_release_event", self._on_heat_release)
         self._fig_heat.canvas.mpl_connect("scroll_event",         self._on_heat_scroll)
 
-        # right – two PlotPanels stacked vertically
         right = tk.Frame(paned, bg=T.BG_APP)
         paned.add(right, minsize=340)
 
-        right_paned = tk.PanedWindow(right, orient=tk.VERTICAL,
-                                     bg=T.COLOR_SASH, sashwidth=5)
-        right_paned.pack(fill=tk.BOTH, expand=True)
+        rpaned = tk.PanedWindow(right, orient=tk.VERTICAL,
+                                bg=T.COLOR_SASH, sashwidth=5)
+        rpaned.pack(fill=tk.BOTH, expand=True)
 
-        spec_frame = tk.Frame(right_paned, bg=T.BG_APP)
-        right_paned.add(spec_frame, minsize=200)
-        self._spec_panel = PlotPanel(
-            spec_frame,
-            xlabel="Wavenumber (cm⁻¹)", ylabel="Intensity",
-            title="Spectra (V-slices)",
-        )
+        spec_f = tk.Frame(rpaned, bg=T.BG_APP)
+        rpaned.add(spec_f, minsize=170)
+        self._spec_panel = PlotPanel(spec_f,
+                                     xlabel="Wavenumber (cm⁻¹)", ylabel="Intensity",
+                                     title="Spectra (V-slices)")
         self._spec_panel.bind_motion(self._on_spec_motion)
 
-        time_frame = tk.Frame(right_paned, bg=T.BG_APP)
-        right_paned.add(time_frame, minsize=200)
-        self._time_panel = PlotPanel(
-            time_frame,
-            xlabel="Time (s)", ylabel="Intensity",
-            title="Time traces (H-slices)",
-        )
+        time_f = tk.Frame(rpaned, bg=T.BG_APP)
+        rpaned.add(time_f, minsize=170)
+        self._time_panel = PlotPanel(time_f,
+                                     xlabel="Time (s)", ylabel="Intensity",
+                                     title="Time traces (H-slices)")
         self._time_panel.bind_motion(self._on_time_motion)
 
-        # ── bottom bar ───────────────────────────────────────────────────
+        # lower half – echem
+        echem_outer = tk.Frame(outer, bg=T.BG_APP)
+        outer.add(echem_outer, minsize=220)
+
+        echem_hdr = tk.Frame(echem_outer, bg="#f0fdf4", pady=2)
+        echem_hdr.pack(fill=tk.X)
+        tk.Label(echem_hdr, text="  Electrochemistry",
+                 bg="#f0fdf4", fg="#166534",
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL, "bold")).pack(side=tk.LEFT)
+        self._echem_sheet_lbl = tk.StringVar(value="")
+        tk.Label(echem_hdr, textvariable=self._echem_sheet_lbl,
+                 bg="#f0fdf4", fg=T.FG_SUBTLE,
+                 font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT, padx=6)
+
+        self._echem_panel = EchemPanel(echem_outer)
+
+        # ── bottom bar ────────────────────────────────────────────────────
         bottom = tk.Frame(r, bg=T.BG_SLICE_BAR)
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
 
-        slice_row = tk.Frame(bottom, bg=T.BG_SLICE_BAR, pady=3)
-        slice_row.pack(fill=tk.X)
-        tk.Label(slice_row, text=" Slices: ",
+        sr = tk.Frame(bottom, bg=T.BG_SLICE_BAR, pady=3)
+        sr.pack(fill=tk.X)
+        tk.Label(sr, text=" Slices: ",
                  bg=T.BG_SLICE_BAR, fg=T.FG_SUBTLE,
                  font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT)
-        self._slice_list_frame = tk.Frame(slice_row, bg=T.BG_SLICE_BAR)
+        self._slice_list_frame = tk.Frame(sr, bg=T.BG_SLICE_BAR)
         self._slice_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         _RRB = "#fefce8"
-        region_row = tk.Frame(bottom, bg=_RRB, pady=3)
-        region_row.pack(fill=tk.X)
-        tk.Label(region_row, text=" Regions:",
+        rr = tk.Frame(bottom, bg=_RRB, pady=3)
+        rr.pack(fill=tk.X)
+        tk.Label(rr, text=" Regions:",
                  bg=_RRB, fg=T.FG_SUBTLE,
                  font=(T.FONT_MONO, T.FONT_SIZE_SMALL)).pack(side=tk.LEFT)
-        self._region_list_frame = tk.Frame(region_row, bg=_RRB)
+        self._region_list_frame = tk.Frame(rr, bg=_RRB)
         self._region_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._REGION_ROW_BG = _RRB
 
@@ -594,7 +841,7 @@ class AnalysisWindow:
         r.bind("<Escape>", lambda e: self._escape_pressed())
 
     # ─────────────────────────────────────────────────────────────────────
-    # Data loading
+    # Raman loading
     # ─────────────────────────────────────────────────────────────────────
 
     def _load_data(self):
@@ -607,12 +854,80 @@ class AnalysisWindow:
             self.root.destroy()
             traceback.print_exc()
             return
-        self.wavenumbers = wn
-        self.times = t
-        self.intensity = Z
+        self.wavenumbers, self.times, self.intensity = wn, t, Z
         self._refresh_heatmap()
         self._add_vertical_slice()
         self._add_horizontal_slice()
+
+        # auto-probe same-name xlsx in same directory
+        candidate = os.path.splitext(self.path)[0] + ".xlsx"
+        if os.path.isfile(candidate):
+            self._load_echem_xlsx(candidate)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Echem loading
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _browse_echem(self):
+        path = filedialog.askopenfilename(
+            title="Select electrochemistry xlsx",
+            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
+            initialdir=os.path.dirname(self.path),
+            parent=self.root,
+        )
+        if path:
+            self._load_echem_xlsx(path)
+
+    def _load_echem_xlsx(self, path: str):
+        try:
+            sheets = load_echem_xlsx(path)
+        except ImportError as exc:
+            messagebox.showerror("Missing dependency", str(exc), parent=self.root)
+            return
+        except Exception as exc:
+            messagebox.showerror("Load error",
+                                 f"Could not read xlsx:\n{path}\n\n{exc}",
+                                 parent=self.root)
+            traceback.print_exc()
+            return
+        if not sheets:
+            messagebox.showwarning("No data",
+                                   "No usable sheets found in the xlsx file.",
+                                   parent=self.root)
+            return
+
+        self._echem_sheets = sheets
+        self._echem_path   = path
+        self._echem_path_var.set(os.path.basename(path))
+
+        names = list(sheets.keys())
+        self._sheet_combo.configure(values=names)
+        best = best_sheet_match(names, self.fname)
+        self._sheet_var.set(best)
+        self._apply_sheet(best)
+
+    def _on_sheet_selected(self, _event=None):
+        name = self._sheet_var.get()
+        if name in self._echem_sheets:
+            self._apply_sheet(name)
+
+    def _apply_sheet(self, name: str):
+        data = self._echem_sheets.get(name)
+        if data is None:
+            return
+        self._echem_panel.load(data)
+        n = len(data.time)
+        self._echem_sheet_lbl.set(f"  {name}  ({n} pts)")
+        self._echem_info_var.set(
+            f"t=[{data.time[0]:.3g}, {data.time[-1]:.3g}] s  "
+            f"| {data.potential_label}: [{np.nanmin(data.potential):.3g}, "
+            f"{np.nanmax(data.potential):.3g}] V"
+            if data.potential.size else ""
+        )
+        self._sync_echem_markers()
+
+    def _sync_echem_markers(self):
+        self._echem_panel.sync_markers(self.slices, self.regions, self.times)
 
     # ─────────────────────────────────────────────────────────────────────
     # Heatmap rendering
@@ -636,7 +951,6 @@ class AnalysisWindow:
             cmap=self._cmap, interpolation="none",
         )
         self._cbar = self._fig_heat.colorbar(self._heatmap_img, ax=ax, location="right")
-        # Redraw slice lines and region rects on top of the new heatmap
         for s in self.slices:
             s.line_obj = None
             self._draw_slice_line(s)
@@ -648,7 +962,7 @@ class AnalysisWindow:
     def _draw_slice_line(self, s: Slice):
         focused = s is self._focused_slice
         lw = 2.2 if focused else 1.4
-        ls = "-" if focused else "--"
+        ls = "-"  if focused else "--"
         if s.kind == "vertical":
             val = self.times[s.index]
             if s.line_obj is None:
@@ -661,33 +975,27 @@ class AnalysisWindow:
                 s.line_obj = self._ax_heat.axhline(val, color=s.color, lw=lw, ls=ls)
             else:
                 s.line_obj.set_ydata([val, val])
-        s.line_obj.set_color(s.color)
-        s.line_obj.set_linewidth(lw)
-        s.line_obj.set_linestyle(ls)
-        s.line_obj.set_visible(s.visible)
+        s.line_obj.set_color(s.color); s.line_obj.set_linewidth(lw)
+        s.line_obj.set_linestyle(ls);  s.line_obj.set_visible(s.visible)
 
     def _draw_region_rect(self, rg: Region):
-        t_lo   = self.times[rg.ti0]
-        t_hi   = self.times[rg.ti1]
-        w_lo   = self.wavenumbers[min(rg.wi0, rg.wi1)]
-        w_hi   = self.wavenumbers[max(rg.wi0, rg.wi1)]
-        width  = t_hi - t_lo
-        height = w_hi - w_lo
-        focused = rg is self._focused_region
-        lw = 2.2 if focused else 1.4
+        t_lo = self.times[rg.ti0];  t_hi = self.times[rg.ti1]
+        w_lo = self.wavenumbers[min(rg.wi0, rg.wi1)]
+        w_hi = self.wavenumbers[max(rg.wi0, rg.wi1)]
+        focused    = rg is self._focused_region
+        lw         = 2.2 if focused else 1.4
         alpha_fill = 0.30 if focused else 0.20
         if rg.rect_obj is None:
             rg.rect_obj = Rectangle(
-                (t_lo, w_lo), width, height,
+                (t_lo, w_lo), t_hi - t_lo, w_hi - w_lo,
                 linewidth=lw, edgecolor=rg.color,
                 facecolor=rg.color, alpha=alpha_fill,
-                linestyle="-", zorder=3,
-            )
+                linestyle="-", zorder=3)
             self._ax_heat.add_patch(rg.rect_obj)
         else:
             rg.rect_obj.set_xy((t_lo, w_lo))
-            rg.rect_obj.set_width(width)
-            rg.rect_obj.set_height(height)
+            rg.rect_obj.set_width(t_hi - t_lo)
+            rg.rect_obj.set_height(w_hi - w_lo)
             rg.rect_obj.set_edgecolor(rg.color)
             rg.rect_obj.set_facecolor(rg.color)
             rg.rect_obj.set_linewidth(lw)
@@ -699,37 +1007,30 @@ class AnalysisWindow:
     # ─────────────────────────────────────────────────────────────────────
 
     def _upsert_slice_in_panel(self, s: Slice):
-        """Push the current slice data into the correct PlotPanel."""
         if not s.visible or self.intensity.size == 0:
-            # hide the line without removing it (keeps uid slot alive)
             panel = self._spec_panel if s.kind == "vertical" else self._time_panel
             if s.uid in panel._lines:
                 panel._lines[s.uid].set_visible(False)
                 panel.redraw()
+            self._sync_echem_markers()
             return
-
         if s.kind == "vertical":
-            xdata = self.wavenumbers
-            ydata = self.intensity[:, s.index]
-            label = f"{s.label}  t={self.times[s.index]:.3g}"
             self._spec_panel.upsert(
-                s.uid, xdata, ydata,
-                label=label, color=s.color, lw=1.4, ls="-", visible=True,
-            )
+                s.uid, self.wavenumbers, self.intensity[:, s.index],
+                label=f"{s.label}  t={self.times[s.index]:.3g}",
+                color=s.color, lw=1.4, ls="-")
             self._spec_panel.redraw()
         else:
-            xdata = self.times
-            ydata = self.intensity[s.index, :]
-            label = f"{s.label}  wn={self.wavenumbers[s.index]:.1f}"
             self._time_panel.upsert(
-                s.uid, xdata, ydata,
-                label=label, color=s.color, lw=1.4, ls="-", visible=True,
-            )
+                s.uid, self.times, self.intensity[s.index, :],
+                label=f"{s.label}  wn={self.wavenumbers[s.index]:.1f}",
+                color=s.color, lw=1.4, ls="-")
             self._time_panel.redraw()
+        self._sync_echem_markers()
 
     def _remove_slice_from_panel(self, s: Slice):
-        panel = self._spec_panel if s.kind == "vertical" else self._time_panel
-        panel.remove(s.uid)
+        (self._spec_panel if s.kind == "vertical" else self._time_panel).remove(s.uid)
+        self._sync_echem_markers()
 
     # ─────────────────────────────────────────────────────────────────────
     # Slice management
@@ -740,36 +1041,31 @@ class AnalysisWindow:
 
     def _add_vertical_slice(self):
         idx = len(self.times) // 2 if self.times.size else 0
-        s = Slice("vertical", idx, _next_color(self._used_colors()))
+        s   = Slice("vertical", idx, _next_color(self._used_colors()))
         self.slices.append(s)
         self._draw_slice_line(s)
-        self._focused_slice = s
-        self._focused_region = None
+        self._focused_slice = s; self._focused_region = None
         self._rebuild_slice_list()
         self._upsert_slice_in_panel(s)
 
     def _add_horizontal_slice(self):
         idx = len(self.wavenumbers) // 2 if self.wavenumbers.size else 0
-        s = Slice("horizontal", idx, _next_color(self._used_colors()))
+        s   = Slice("horizontal", idx, _next_color(self._used_colors()))
         self.slices.append(s)
         self._draw_slice_line(s)
-        self._focused_slice = s
-        self._focused_region = None
+        self._focused_slice = s; self._focused_region = None
         self._rebuild_slice_list()
         self._upsert_slice_in_panel(s)
 
     def _set_focused_slice(self, s: Optional[Slice]):
         prev_sl = self._focused_slice
         prev_rg = self._focused_region
-        self._focused_slice = s
-        self._focused_region = None
+        self._focused_slice = s; self._focused_region = None
         if prev_rg is not None:
-            self._draw_region_rect(prev_rg)
-            self._update_region_widgets(prev_rg)
+            self._draw_region_rect(prev_rg); self._update_region_widgets(prev_rg)
         for sl in [prev_sl, s]:
             if sl is not None:
-                self._draw_slice_line(sl)
-                self._update_slice_widgets(sl)
+                self._draw_slice_line(sl); self._update_slice_widgets(sl)
         self._canvas_heat.draw_idle()
 
     def _nudge_focused(self, delta: int):
@@ -852,25 +1148,20 @@ class AnalysisWindow:
         rg = Region(ti0, ti1, wi0, wi1, _next_color(self._used_colors()))
         self.regions.append(rg)
         self._draw_region_rect(rg)
-        self._focused_region = rg
-        self._focused_slice = None
+        self._focused_region = rg; self._focused_slice = None
         self._rebuild_region_list()
-        # open a detail window automatically for the new region
         self._open_region_detail(rg)
+        self._sync_echem_markers()
         self._canvas_heat.draw_idle()
 
     def _set_focused_region(self, rg: Optional[Region]):
-        prev_rg = self._focused_region
-        prev_sl = self._focused_slice
-        self._focused_region = rg
-        self._focused_slice = None
+        prev_rg = self._focused_region; prev_sl = self._focused_slice
+        self._focused_region = rg; self._focused_slice = None
         if prev_sl is not None:
-            self._draw_slice_line(prev_sl)
-            self._update_slice_widgets(prev_sl)
+            self._draw_slice_line(prev_sl); self._update_slice_widgets(prev_sl)
         for r in [prev_rg, rg]:
             if r is not None:
-                self._draw_region_rect(r)
-                self._update_region_widgets(r)
+                self._draw_region_rect(r); self._update_region_widgets(r)
         self._canvas_heat.draw_idle()
 
     def _remove_region(self, rg: Region):
@@ -880,26 +1171,22 @@ class AnalysisWindow:
             except Exception:
                 pass
         if rg.detail_window is not None:
-            rg.detail_window.destroy()
-            rg.detail_window = None
+            rg.detail_window.destroy(); rg.detail_window = None
         self.regions.remove(rg)
         if self._focused_region is rg:
             self._focused_region = None
         self._canvas_heat.draw_idle()
         self._rebuild_region_list()
+        self._sync_echem_markers()
 
     def _open_region_detail(self, rg: Region):
-        """Open (or bring to front) the detail window for *rg*."""
         if rg.detail_window is not None:
             try:
-                rg.detail_window._top.lift()
-                return
+                rg.detail_window._top.lift(); return
             except Exception:
                 rg.detail_window = None
         rg.detail_window = RegionPlotWindow(
-            self.root, rg,
-            self.wavenumbers, self.times, self.intensity,
-        )
+            self.root, rg, self.wavenumbers, self.times, self.intensity)
 
     # ─────────────────────────────────────────────────────────────────────
     # Heatmap mouse events
@@ -912,71 +1199,57 @@ class AnalysisWindow:
         best, best_dist = None, np.inf
         for s in self.slices:
             if s.kind == "vertical":
-                dv = self.times[s.index]
-                d  = ax.transData.transform((dv, event.ydata))
-                c  = ax.transData.transform((event.xdata, event.ydata))
+                d = ax.transData.transform((self.times[s.index], event.ydata))
+                c = ax.transData.transform((event.xdata, event.ydata))
                 dist = abs(d[0] - c[0])
             else:
-                dv = self.wavenumbers[s.index]
-                d  = ax.transData.transform((event.xdata, dv))
-                c  = ax.transData.transform((event.xdata, event.ydata))
+                d = ax.transData.transform((event.xdata, self.wavenumbers[s.index]))
+                c = ax.transData.transform((event.xdata, event.ydata))
                 dist = abs(d[1] - c[1])
             if dist < best_dist:
-                best_dist = dist
-                best = s
+                best_dist = dist; best = s
         return best if best_dist < 12 else None
 
     def _on_heat_press(self, event):
         if event.inaxes != self._ax_heat or event.xdata is None:
             return
-
         if self._mode == self.MODE_REGION:
-            self._draw_start = (event.xdata, event.ydata)
+            self._draw_start      = (event.xdata, event.ydata)
             self._draw_rect_patch = Rectangle(
                 (event.xdata, event.ydata), 0, 0,
                 linewidth=1.5, edgecolor="#854d0e",
                 facecolor="#fde047", alpha=0.25,
-                linestyle="--", zorder=4,
-            )
+                linestyle="--", zorder=4)
             self._ax_heat.add_patch(self._draw_rect_patch)
             return
-
         s = self._nearest_slice(event)
         if s is not None:
-            self._drag_slice = s
-            self._set_focused_slice(s)
-            return
-
+            self._drag_slice = s; self._set_focused_slice(s); return
         for rg in self.regions:
-            t_lo = self.times[rg.ti0]
-            t_hi = self.times[rg.ti1]
+            t_lo = self.times[rg.ti0];  t_hi = self.times[rg.ti1]
             w_lo = self.wavenumbers[min(rg.wi0, rg.wi1)]
             w_hi = self.wavenumbers[max(rg.wi0, rg.wi1)]
             if t_lo <= event.xdata <= t_hi and w_lo <= event.ydata <= w_hi:
-                self._set_focused_region(rg)
-                return
-
+                self._set_focused_region(rg); return
         self._set_focused_slice(None)
 
     def _on_heat_motion(self, event):
         if event.inaxes != self._ax_heat or event.xdata is None:
             return
-
-        ti = int(np.clip(np.searchsorted(self.times, event.xdata),
-                         0, len(self.times) - 1))
-        wi = int(np.clip(np.searchsorted(self.wavenumbers, event.ydata),
-                         0, len(self.wavenumbers) - 1))
+        ti  = int(np.clip(np.searchsorted(self.times, event.xdata),
+                          0, len(self.times) - 1))
+        wi  = int(np.clip(np.searchsorted(self.wavenumbers, event.ydata),
+                          0, len(self.wavenumbers) - 1))
         val = self.intensity[wi, ti] if self.intensity.size else 0
         self._info_var.set(
             f"t={self.times[ti]:.3g}  wn={self.wavenumbers[wi]:.1f}  I={val:.4g}")
 
         if self._mode == self.MODE_REGION and self._draw_start is not None:
             x0, y0 = self._draw_start
-            x1, y1 = event.xdata, event.ydata
             if self._draw_rect_patch is not None:
-                self._draw_rect_patch.set_xy((min(x0, x1), min(y0, y1)))
-                self._draw_rect_patch.set_width(abs(x1 - x0))
-                self._draw_rect_patch.set_height(abs(y1 - y0))
+                self._draw_rect_patch.set_xy((min(x0, event.xdata), min(y0, event.ydata)))
+                self._draw_rect_patch.set_width(abs(event.xdata - x0))
+                self._draw_rect_patch.set_height(abs(event.ydata - y0))
                 self._canvas_heat.draw_idle()
             return
 
@@ -1011,11 +1284,10 @@ class AnalysisWindow:
         self._drag_slice = None
 
     def _on_heat_scroll(self, event):
-        delta = 1 if event.button == "up" else -1
-        self._nudge_focused(delta)
+        self._nudge_focused(1 if event.button == "up" else -1)
 
     # ─────────────────────────────────────────────────────────────────────
-    # Side panel crosshair info
+    # Side panel motion info
     # ─────────────────────────────────────────────────────────────────────
 
     def _on_spec_motion(self, event):
@@ -1053,10 +1325,9 @@ class AnalysisWindow:
 
     def _create_slice_widgets(self, s: Slice) -> dict:
         focused = s is self._focused_slice
-        border_color = s.color if focused else T.COLOR_SPINE
         frame = tk.Frame(self._slice_list_frame, bg=T.BG_SLICE_BAR, padx=3, pady=1)
         frame.pack(side=tk.LEFT)
-        inner = tk.Frame(frame, bg=border_color, padx=1, pady=1)
+        inner = tk.Frame(frame, bg=s.color if focused else T.COLOR_SPINE, padx=1, pady=1)
         inner.pack()
         row = tk.Frame(inner, bg=T.BG_PANEL)
         row.pack()
@@ -1065,41 +1336,41 @@ class AnalysisWindow:
         swatch.pack(side=tk.LEFT)
         swatch.bind("<Button-1>", lambda e, sl=s: self._pick_slice_color(sl))
 
-        arr = self.times if s.kind == "vertical" else self.wavenumbers
-        val = arr[s.index] if arr.size else 0
+        arr  = self.times if s.kind == "vertical" else self.wavenumbers
+        val  = arr[s.index] if arr.size else 0
         icon = "|" if s.kind == "vertical" else "-"
-        lbl = tk.Label(row, text=f" {icon}{s.label}={val:.3g} ",
-                       bg=T.BG_PANEL, fg=s.color,
-                       font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
+        lbl  = tk.Label(row, text=f" {icon}{s.label}={val:.3g} ",
+                        bg=T.BG_PANEL, fg=s.color,
+                        font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
         lbl.pack(side=tk.LEFT)
         lbl.bind("<Button-1>", lambda e, sl=s: self._set_focused_slice(sl))
 
-        vis_btn = tk.Label(row, text="O" if s.visible else "o",
-                           bg=T.BG_PANEL, fg=T.FG_SUBTLE,
-                           font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
-        vis_btn.pack(side=tk.LEFT)
-        vis_btn.bind("<Button-1>", lambda e, sl=s: self._toggle_slice_visible(sl))
+        vis = tk.Label(row, text="O" if s.visible else "o",
+                       bg=T.BG_PANEL, fg=T.FG_SUBTLE,
+                       font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
+        vis.pack(side=tk.LEFT)
+        vis.bind("<Button-1>", lambda e, sl=s: self._toggle_slice_visible(sl))
 
-        return dict(inner=inner, swatch=swatch, lbl=lbl, vis_btn=vis_btn)
+        return dict(inner=inner, swatch=swatch, lbl=lbl, vis_btn=vis)
 
     def _update_slice_widgets(self, s: Slice):
-        widgets = self._slice_widgets.get(s.uid)
-        if widgets is None:
+        w = self._slice_widgets.get(s.uid)
+        if w is None:
             return
         focused = s is self._focused_slice
-        widgets["inner"].configure(bg=s.color if focused else T.COLOR_SPINE)
-        widgets["swatch"].configure(bg=s.color)
-        arr = self.times if s.kind == "vertical" else self.wavenumbers
-        val = arr[s.index] if arr.size else 0
+        w["inner"].configure(bg=s.color if focused else T.COLOR_SPINE)
+        w["swatch"].configure(bg=s.color)
+        arr  = self.times if s.kind == "vertical" else self.wavenumbers
+        val  = arr[s.index] if arr.size else 0
         icon = "|" if s.kind == "vertical" else "-"
-        widgets["lbl"].configure(text=f" {icon}{s.label}={val:.3g} ", fg=s.color)
-        widgets["vis_btn"].configure(text="O" if s.visible else "o")
+        w["lbl"].configure(text=f" {icon}{s.label}={val:.3g} ", fg=s.color)
+        w["vis_btn"].configure(text="O" if s.visible else "o")
 
     def _pick_slice_color(self, s: Slice):
-        color = colorchooser.askcolor(color=s.color, title=f"Color for {s.label}",
-                                      parent=self.root)
-        if color and color[1]:
-            s.color = color[1]
+        c = colorchooser.askcolor(color=s.color, title=f"Color for {s.label}",
+                                  parent=self.root)
+        if c and c[1]:
+            s.color = c[1]
             self._draw_slice_line(s)
             self._canvas_heat.draw_idle()
             self._upsert_slice_in_panel(s)
@@ -1125,12 +1396,10 @@ class AnalysisWindow:
 
     def _create_region_widgets(self, rg: Region) -> dict:
         focused = rg is self._focused_region
-        border_color = rg.color if focused else T.COLOR_SPINE
         bg = self._REGION_ROW_BG
-
         frame = tk.Frame(self._region_list_frame, bg=bg, padx=3, pady=1)
         frame.pack(side=tk.LEFT)
-        inner = tk.Frame(frame, bg=border_color, padx=1, pady=1)
+        inner = tk.Frame(frame, bg=rg.color if focused else T.COLOR_SPINE, padx=1, pady=1)
         inner.pack()
         row = tk.Frame(inner, bg=T.BG_PANEL)
         row.pack()
@@ -1145,11 +1414,11 @@ class AnalysisWindow:
         lbl.pack(side=tk.LEFT)
         lbl.bind("<Button-1>", lambda e, r=rg: self._set_focused_region(r))
 
-        vis_btn = tk.Label(row, text="O" if rg.visible else "o",
-                           bg=T.BG_PANEL, fg=T.FG_SUBTLE,
-                           font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
-        vis_btn.pack(side=tk.LEFT)
-        vis_btn.bind("<Button-1>", lambda e, r=rg: self._toggle_region_visible(r))
+        vis = tk.Label(row, text="O" if rg.visible else "o",
+                       bg=T.BG_PANEL, fg=T.FG_SUBTLE,
+                       font=(T.FONT_MONO, T.FONT_SIZE_SMALL), cursor="hand2")
+        vis.pack(side=tk.LEFT)
+        vis.bind("<Button-1>", lambda e, r=rg: self._toggle_region_visible(r))
 
         open_btn = tk.Label(row, text=" ⊞",
                             bg=T.BG_PANEL, fg="#0284c7",
@@ -1163,43 +1432,44 @@ class AnalysisWindow:
         del_btn.pack(side=tk.LEFT)
         del_btn.bind("<Button-1>", lambda e, r=rg: self._remove_region(r))
 
-        return dict(inner=inner, swatch=swatch, lbl=lbl, vis_btn=vis_btn)
+        return dict(inner=inner, swatch=swatch, lbl=lbl, vis_btn=vis)
 
     def _region_label_text(self, rg: Region) -> str:
         if not self.times.size or not self.wavenumbers.size:
             return f" [{rg.label}] "
-        t_lo = self.times[rg.ti0]
-        t_hi = self.times[rg.ti1]
+        t_lo = self.times[rg.ti0];   t_hi = self.times[rg.ti1]
         w_lo = self.wavenumbers[min(rg.wi0, rg.wi1)]
         w_hi = self.wavenumbers[max(rg.wi0, rg.wi1)]
         return f" [{rg.label}] t:[{t_lo:.3g},{t_hi:.3g}] wn:[{w_lo:.0f},{w_hi:.0f}] "
 
     def _update_region_widgets(self, rg: Region):
-        widgets = self._region_widgets.get(rg.uid)
-        if widgets is None:
+        w = self._region_widgets.get(rg.uid)
+        if w is None:
             return
         focused = rg is self._focused_region
-        widgets["inner"].configure(bg=rg.color if focused else T.COLOR_SPINE)
-        widgets["swatch"].configure(bg=rg.color)
-        widgets["lbl"].configure(text=self._region_label_text(rg), fg=rg.color)
-        widgets["vis_btn"].configure(text="O" if rg.visible else "o")
+        w["inner"].configure(bg=rg.color if focused else T.COLOR_SPINE)
+        w["swatch"].configure(bg=rg.color)
+        w["lbl"].configure(text=self._region_label_text(rg), fg=rg.color)
+        w["vis_btn"].configure(text="O" if rg.visible else "o")
 
     def _pick_region_color(self, rg: Region):
-        color = colorchooser.askcolor(color=rg.color, title=f"Color for {rg.label}",
-                                      parent=self.root)
-        if color and color[1]:
-            rg.color = color[1]
+        c = colorchooser.askcolor(color=rg.color, title=f"Color for {rg.label}",
+                                  parent=self.root)
+        if c and c[1]:
+            rg.color = c[1]
             self._draw_region_rect(rg)
             self._canvas_heat.draw_idle()
             if rg.detail_window is not None:
                 rg.detail_window.update_color()
             self._update_region_widgets(rg)
+            self._sync_echem_markers()
 
     def _toggle_region_visible(self, rg: Region):
         rg.visible = not rg.visible
         self._draw_region_rect(rg)
         self._canvas_heat.draw_idle()
         self._update_region_widgets(rg)
+        self._sync_echem_markers()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
